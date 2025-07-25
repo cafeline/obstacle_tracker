@@ -667,6 +667,10 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters)
     auto dynamic_markers = createMarkerArray(dynamic_clusters, true);
     auto static_markers = createMarkerArray(static_clusters, false);
     
+    // 古いマーカーをクリアするためのマーカーを追加
+    addClearMarkers(dynamic_markers, "dynamic_obstacles");
+    addClearMarkers(static_markers, "static_obstacles");
+    
     dynamic_obstacles_publisher_->publish(dynamic_markers);
     static_obstacles_publisher_->publish(static_markers);
     
@@ -674,6 +678,10 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters)
     if (enable_ellipse_markers_) {
         auto dynamic_ellipses = createEllipseMarkers(dynamic_clusters, true);
         auto static_ellipses = createEllipseMarkers(static_clusters, false);
+        
+        // 楕円マーカーの古いマーカーもクリア
+        addClearMarkers(dynamic_ellipses, "dynamic_ellipses");
+        addClearMarkers(static_ellipses, "static_ellipses");
         
         dynamic_ellipse_publisher_->publish(dynamic_ellipses);
         static_ellipse_publisher_->publish(static_ellipses);
@@ -687,7 +695,7 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createMarkerArray(
     const std::vector<Cluster>& clusters, bool is_dynamic)
 {
     visualization_msgs::msg::MarkerArray marker_array;
-    int marker_id = 0;
+    int marker_id = 1; // 0はクリアマーカー用に予約
     
     for (const auto& cluster : clusters) {
         // クラスタ内の各点（ボクセル）に対して四角形マーカーを作成
@@ -727,7 +735,8 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createMarkerArray(
             }
             marker.color.a = 0.8;
             
-            marker.lifetime = rclcpp::Duration::from_seconds(0.2);
+            // マーカーを常時表示するため、lifetimeを0（永続）に設定
+            marker.lifetime = rclcpp::Duration::from_seconds(0.0);
             marker_array.markers.push_back(marker);
         }
     }
@@ -902,6 +911,7 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
     const std::vector<Cluster>& clusters, bool is_dynamic)
 {
     visualization_msgs::msg::MarkerArray marker_array;
+    int marker_id = 1; // 0はクリアマーカー用に予約
     
     for (const auto& cluster : clusters) {
         if (cluster.points.empty()) continue;
@@ -913,7 +923,7 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
         marker.header.frame_id = "map";
         marker.header.stamp = this->now();
         marker.ns = is_dynamic ? "dynamic_ellipses" : "static_ellipses";
-        marker.id = cluster.id;
+        marker.id = marker_id++; // 連番でID割り当て
         marker.type = visualization_msgs::msg::Marker::CYLINDER; // 楕円は円柱で近似
         marker.action = visualization_msgs::msg::Marker::ADD;
         
@@ -924,11 +934,14 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
         marker.pose.position.y = map_center.y;
         marker.pose.position.z = map_center.z;
         
+        // 楕円の向きをロボットの回転に合わせて変換
+        double map_orientation = transformOrientationToMap(ellipse.orientation, current_time);
+        
         // 回転設定（Z軸回りの回転）
         marker.pose.orientation.x = 0.0;
         marker.pose.orientation.y = 0.0;
-        marker.pose.orientation.z = std::sin(ellipse.orientation / 2.0);
-        marker.pose.orientation.w = std::cos(ellipse.orientation / 2.0);
+        marker.pose.orientation.z = std::sin(map_orientation / 2.0);
+        marker.pose.orientation.w = std::cos(map_orientation / 2.0);
         
         // サイズ設定（楕円のサイズをスケール）
         marker.scale.x = ellipse.semi_major_axis * 2.0 * ellipse_scale_factor_;
@@ -947,7 +960,8 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
         }
         marker.color.a = 0.3; // 透明度
         
-        marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+        // 楕円マーカーを常時表示するため、lifetimeを0（永続）に設定
+        marker.lifetime = rclcpp::Duration::from_seconds(0.0);
         marker_array.markers.push_back(marker);
     }
     
@@ -1051,6 +1065,61 @@ ObstacleTrackerNode::EllipseParams ObstacleTrackerNode::calculateClusterEllipse(
     }
     
     return ellipse;
+}
+
+double ObstacleTrackerNode::transformOrientationToMap(double lidar_orientation, const rclcpp::Time& stamp)
+{
+    try {
+        // lidar_linkからmapフレームへの変換を取得
+        geometry_msgs::msg::TransformStamped transform = 
+            tf_buffer_->lookupTransform("map", "lidar_link", tf2::TimePointZero);
+        
+        // クォータニオンからZ軸回りの回転角（ヨー角）を抽出
+        // 簡単な変換式を使用: yaw = atan2(2(qw*qz + qx*qy), 1 - 2(qy² + qz²))
+        double qx = transform.transform.rotation.x;
+        double qy = transform.transform.rotation.y;
+        double qz = transform.transform.rotation.z;
+        double qw = transform.transform.rotation.w;
+        
+        double yaw = std::atan2(2.0 * (qw * qz + qx * qy), 
+                               1.0 - 2.0 * (qy * qy + qz * qz));
+        
+        // lidar_linkフレームでの楕円の向きにロボットの回転を加算
+        double map_orientation = lidar_orientation + yaw;
+        
+        // 角度を [-π, π] の範囲に正規化
+        while (map_orientation > M_PI) map_orientation -= 2.0 * M_PI;
+        while (map_orientation < -M_PI) map_orientation += 2.0 * M_PI;
+        
+        return map_orientation;
+        
+    } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "楕円の向き変換に失敗しました (lidar_link -> map): %s", ex.what());
+        
+        // 変換に失敗した場合は元の向きをそのまま返す
+        return lidar_orientation;
+    }
+}
+
+void ObstacleTrackerNode::addClearMarkers(visualization_msgs::msg::MarkerArray& marker_array, 
+                                         const std::string& namespace_name)
+{
+    // DELETEALLマーカーを先頭に追加して、古いマーカーをクリア
+    visualization_msgs::msg::Marker clear_marker;
+    clear_marker.header.frame_id = "map";
+    clear_marker.header.stamp = this->now();
+    clear_marker.ns = namespace_name;
+    clear_marker.id = 0;
+    clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    
+    // marker_arrayの先頭に挿入
+    marker_array.markers.insert(marker_array.markers.begin(), clear_marker);
+    
+    // 既存マーカーのIDを1から開始するように調整
+    for (size_t i = 1; i < marker_array.markers.size(); ++i) {
+        marker_array.markers[i].id = static_cast<int>(i);
+    }
 }
 
 } // namespace obstacle_tracker

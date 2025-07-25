@@ -58,6 +58,8 @@ private:
         const std::vector<Cluster>& clusters, bool is_dynamic);
     visualization_msgs::msg::MarkerArray createEllipseMarkers(
         const std::vector<Cluster>& clusters, bool is_dynamic);
+    void addClearMarkers(visualization_msgs::msg::MarkerArray& marker_array, 
+                        const std::string& namespace_name);
     
     // ユーティリティ関数
     double calculateDistance(const Point3D& p1, const Point3D& p2);
@@ -65,6 +67,7 @@ private:
     bool isWithinProcessingRange(const Point3D& point);
     Point3D transformPointToMap(const Point3D& point, const std::string& source_frame, 
                                const rclcpp::Time& stamp);
+    double transformOrientationToMap(double lidar_orientation, const rclcpp::Time& stamp);
     Point3D getRobotVelocity();
     
     // パラメータ検証

@@ -62,6 +62,7 @@ private:
     bool isWithinProcessingRange(const Point3D& point);
     Point3D transformPointToMap(const Point3D& point, const std::string& source_frame, 
                                const rclcpp::Time& stamp);
+    Point3D getRobotVelocity();
     
     // ROS2要素
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber_;
@@ -74,6 +75,8 @@ private:
     double voxel_size_;
     double clustering_max_distance_;
     int min_cluster_points_;
+    double processing_frequency_;
+    double max_computation_time_;
     
     // TF関連
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -83,6 +86,16 @@ private:
     std::map<int, Cluster> previous_clusters_;
     int next_cluster_id_;
     rclcpp::Time last_scan_time_;
+    
+    // ロボット速度追跡
+    Point3D previous_robot_position_;
+    rclcpp::Time previous_robot_time_;
+    Point3D current_robot_velocity_;
+    bool robot_velocity_initialized_;
+    
+    // 処理頻度制限
+    rclcpp::Time last_processing_time_;
+    bool processing_time_initialized_;
 };
 
 } // namespace obstacle_tracker

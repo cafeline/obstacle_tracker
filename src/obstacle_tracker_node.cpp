@@ -1,15 +1,20 @@
 #include "obstacle_tracker/obstacle_tracker_node.hpp"
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 
 namespace obstacle_tracker
 {
 
-ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next_cluster_id_(1)
+ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next_cluster_id_(1), 
+                                           robot_velocity_initialized_(false), processing_time_initialized_(false)
 {
     // TFバッファとリスナーの初期化
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    
+    // ロボット速度追跡の初期化
+    current_robot_velocity_ = Point3D(0, 0, 0);
     
     // パラメータの宣言とデフォルト値設定
     this->declare_parameter("robot_processing_range", 10.0);
@@ -17,6 +22,8 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     this->declare_parameter("voxel_size", 0.2);
     this->declare_parameter("clustering_max_distance", 0.3);
     this->declare_parameter("min_cluster_points", 2);
+    this->declare_parameter("processing_frequency", 20.0);
+    this->declare_parameter("max_computation_time", 0.05);
     
     // パラメータの取得
     robot_processing_range_ = this->get_parameter("robot_processing_range").as_double();
@@ -24,6 +31,8 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     voxel_size_ = this->get_parameter("voxel_size").as_double();
     clustering_max_distance_ = this->get_parameter("clustering_max_distance").as_double();
     min_cluster_points_ = this->get_parameter("min_cluster_points").as_int();
+    processing_frequency_ = this->get_parameter("processing_frequency").as_double();
+    max_computation_time_ = this->get_parameter("max_computation_time").as_double();
     
     // サブスクライバーとパブリッシャーの作成
     scan_subscriber_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
@@ -38,11 +47,33 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     RCLCPP_INFO(this->get_logger(), "ObstacleTracker node initialized");
     RCLCPP_INFO(this->get_logger(), "Processing range: %.2f m", robot_processing_range_);
     RCLCPP_INFO(this->get_logger(), "Dynamic threshold: %.2f m/s", dynamic_cluster_speed_threshold_);
+    RCLCPP_INFO(this->get_logger(), "Processing frequency: %.1f Hz", processing_frequency_);
+    RCLCPP_INFO(this->get_logger(), "Max computation time: %.3f s", max_computation_time_);
 }
 
 void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
 {
     try {
+        // 処理頻度制限チェック
+        rclcpp::Time current_time = this->now();
+        if (processing_time_initialized_) {
+            double dt = (current_time - last_processing_time_).seconds();
+            double min_interval = 1.0 / processing_frequency_;
+            
+            if (dt < min_interval) {
+                // 処理頻度制限により処理をスキップ
+                RCLCPP_DEBUG(this->get_logger(), 
+                    "Processing skipped due to frequency limit: dt=%.3f, min_interval=%.3f", 
+                    dt, min_interval);
+                return;
+            }
+        } else {
+            processing_time_initialized_ = true;
+        }
+        
+        // 処理時間計測開始
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
         // スキャン時間を保存
         last_scan_time_ = msg->header.stamp;
         
@@ -63,6 +94,24 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
         
         // 6. 結果を配信
         publishObstacles(clusters);
+        
+        // 処理時間計測終了
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto computation_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        double computation_time_sec = computation_time.count() / 1000000.0;
+        
+        // 処理時間監視
+        if (computation_time_sec > max_computation_time_) {
+            RCLCPP_WARN(this->get_logger(), 
+                "Processing time exceeded limit: %.3f s (limit: %.3f s)", 
+                computation_time_sec, max_computation_time_);
+        } else {
+            RCLCPP_DEBUG(this->get_logger(), 
+                "Processing completed in %.3f s", computation_time_sec);
+        }
+        
+        // 最後の処理時間を更新
+        last_processing_time_ = current_time;
         
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "Error in laser scan processing: %s", e.what());
@@ -177,6 +226,9 @@ std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3
 
 void ObstacleTrackerNode::trackClusters(std::vector<Cluster>& clusters)
 {
+    // ロボットの現在速度を取得
+    Point3D robot_velocity = getRobotVelocity();
+    
     // シンプルな最近隣マッチングによる追跡
     for (auto& cluster : clusters) {
         double min_distance = std::numeric_limits<double>::max();
@@ -198,13 +250,25 @@ void ObstacleTrackerNode::trackClusters(std::vector<Cluster>& clusters)
             cluster.id = best_match_id;
             const auto& prev_cluster = previous_clusters_[best_match_id];
             
-            // シンプルな移動平均による速度計算
+            // シンプルな移動平均による相対速度計算
             double dt = 0.1; // 仮定: 10Hz
-            cluster.velocity.x = (cluster.centroid.x - prev_cluster.centroid.x) / dt;
-            cluster.velocity.y = (cluster.centroid.y - prev_cluster.centroid.y) / dt;
+            Point3D relative_velocity;
+            relative_velocity.x = (cluster.centroid.x - prev_cluster.centroid.x) / dt;
+            relative_velocity.y = (cluster.centroid.y - prev_cluster.centroid.y) / dt;
+            relative_velocity.z = 0.0;
+            
+            // ロボットの移動速度を差し引いて絶対速度（マップに対する速度）を計算
+            cluster.velocity.x = relative_velocity.x - robot_velocity.x;
+            cluster.velocity.y = relative_velocity.y - robot_velocity.y;
             cluster.velocity.z = 0.0;
             
             cluster.track_count = prev_cluster.track_count + 1;
+            
+            RCLCPP_DEBUG(this->get_logger(), 
+                "Cluster %d: relative_vel=(%.2f,%.2f), robot_vel=(%.2f,%.2f), absolute_vel=(%.2f,%.2f)",
+                cluster.id, relative_velocity.x, relative_velocity.y,
+                robot_velocity.x, robot_velocity.y,
+                cluster.velocity.x, cluster.velocity.y);
         } else {
             // 新しいクラスタの場合
             cluster.velocity = Point3D(0, 0, 0);
@@ -364,6 +428,54 @@ Point3D ObstacleTrackerNode::transformPointToMap(const Point3D& point, const std
         
         // 変換に失敗した場合でも処理を継続するため、元の座標をそのまま返す
         return point;
+    }
+}
+
+Point3D ObstacleTrackerNode::getRobotVelocity()
+{
+    try {
+        // base_footprintの現在位置をmapフレームで取得
+        geometry_msgs::msg::TransformStamped transform = 
+            tf_buffer_->lookupTransform("map", "base_footprint", tf2::TimePointZero);
+        
+        Point3D current_position(
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z
+        );
+        
+        rclcpp::Time current_time = this->now();
+        
+        if (robot_velocity_initialized_) {
+            // 前回位置との差分から速度を計算
+            double dt = (current_time - previous_robot_time_).seconds();
+            if (dt > 0.0 && dt < 1.0) {  // 妥当な時間差の場合のみ
+                current_robot_velocity_.x = (current_position.x - previous_robot_position_.x) / dt;
+                current_robot_velocity_.y = (current_position.y - previous_robot_position_.y) / dt;
+                current_robot_velocity_.z = 0.0;
+                
+                RCLCPP_DEBUG(this->get_logger(), 
+                    "Robot velocity: (%.2f, %.2f) m/s, dt=%.3f",
+                    current_robot_velocity_.x, current_robot_velocity_.y, dt);
+            }
+        } else {
+            // 初回の場合は速度を0に設定
+            current_robot_velocity_ = Point3D(0, 0, 0);
+            robot_velocity_initialized_ = true;
+        }
+        
+        // 現在位置と時刻を保存
+        previous_robot_position_ = current_position;
+        previous_robot_time_ = current_time;
+        
+        return current_robot_velocity_;
+        
+    } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "ロボット位置取得に失敗しました (base_footprint -> map): %s", ex.what());
+        
+        // 変換に失敗した場合は前回の速度を返す
+        return current_robot_velocity_;
     }
 }
 

@@ -389,6 +389,10 @@ std::vector<Point3D> ObstacleTrackerNode::voxelizePoints(const std::vector<Point
         voxelized_points.push_back(value.first);
     }
     
+    RCLCPP_DEBUG(this->get_logger(), 
+        "Voxelization: %zu input points -> %zu voxels (voxel_size=%.2fm)", 
+        points.size(), voxelized_points.size(), voxel_size_);
+    
     return voxelized_points;
 }
 
@@ -437,7 +441,7 @@ std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3
             }
         }
         
-        // 最小点数チェック
+        // 最小点数チェック （デバッグ情報追加）
         if (static_cast<int>(cluster.points.size()) >= min_cluster_points_) {
             Point3D laser_centroid = calculateCentroid(cluster.points);
             // lidar_linkフレームからmapフレームに変換（キャッシュした時刻使用）
@@ -448,12 +452,24 @@ std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3
             if (std::isfinite(map_centroid.x) && std::isfinite(map_centroid.y) && std::isfinite(map_centroid.z)) {
                 cluster.centroid = map_centroid;
                 clusters.push_back(cluster);
+                
+                RCLCPP_DEBUG(this->get_logger(), 
+                    "Cluster %d: %zu points, centroid=(%.2f,%.2f)", 
+                    cluster.id, cluster.points.size(), cluster.centroid.x, cluster.centroid.y);
             } else {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Invalid cluster centroid after TF transform, skipping cluster");
             }
+        } else {
+            RCLCPP_DEBUG(this->get_logger(), 
+                "Cluster rejected: %zu points < min_cluster_points(%d)", 
+                cluster.points.size(), min_cluster_points_);
         }
     }
+    
+    RCLCPP_DEBUG(this->get_logger(), 
+        "Simple clustering: %zu voxels -> %zu clusters (threshold=%.2fm, min_points=%d)", 
+        voxelized_points.size(), clusters.size(), clustering_max_distance_, min_cluster_points_);
     
     return clusters;
 }

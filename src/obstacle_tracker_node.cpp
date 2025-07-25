@@ -253,9 +253,9 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
         // 2. ボクセル化
         std::vector<Point3D> voxelized_points = voxelizePoints(points);
         
-        // 3. クラスタリング
+        // 3. クラスタリング（時刻を統一して渡す）
         std::vector<Cluster> clusters = enable_adaptive_dbscan_ ? 
-            adaptiveDBSCANCluster(voxelized_points) : clusterPoints(voxelized_points);
+            adaptiveDBSCANCluster(voxelized_points, current_time) : clusterPoints(voxelized_points, current_time);
         
         // 4. クラスタ追跡
         trackClusters(clusters);
@@ -263,8 +263,8 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
         // 5. 動的・静的分類
         classifyClusters(clusters);
         
-        // 6. 結果を配信
-        publishObstacles(clusters);
+        // 6. 結果を配信（時刻を統一して渡す）
+        publishObstacles(clusters, current_time);
         
         // 処理時間計測終了
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -335,6 +335,7 @@ std::vector<Point3D> ObstacleTrackerNode::convertScanToPoints(const sensor_msgs:
         point.x = range * cos_angle;
         point.y = range * sin_angle;
         point.z = 0.0;
+        point.angle = angle;  // 元の角度情報を保持
         
         // 変換結果の妥当性チェック
         if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
@@ -374,6 +375,8 @@ std::vector<Point3D> ObstacleTrackerNode::voxelizePoints(const std::vector<Point
             sum_point.x = (sum_point.x * count + point.x) / (count + 1);
             sum_point.y = (sum_point.y * count + point.y) / (count + 1);
             sum_point.z = (sum_point.z * count + point.z) / (count + 1);
+            // 角度の平均計算（円周性を考慮した単純平均）
+            sum_point.angle = (sum_point.angle * count + point.angle) / (count + 1);
             count++;
         } else {
             // 新規ボクセル
@@ -396,7 +399,7 @@ std::vector<Point3D> ObstacleTrackerNode::voxelizePoints(const std::vector<Point
     return voxelized_points;
 }
 
-std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3D>& voxelized_points)
+std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3D>& voxelized_points, const rclcpp::Time& timestamp)
 {
     std::vector<Cluster> clusters;
     std::vector<bool> visited(voxelized_points.size(), false);
@@ -444,9 +447,8 @@ std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3
         // 最小点数チェック （デバッグ情報追加）
         if (static_cast<int>(cluster.points.size()) >= min_cluster_points_) {
             Point3D laser_centroid = calculateCentroid(cluster.points);
-            // lidar_linkフレームからmapフレームに変換（キャッシュした時刻使用）
-            const rclcpp::Time current_time = this->now();
-            Point3D map_centroid = transformPointToMap(laser_centroid, "lidar_link", current_time);
+            // lidar_linkフレームからmapフレームに変換（統一された時刻使用）
+            Point3D map_centroid = transformPointToMap(laser_centroid, "lidar_link", timestamp);
             
             // TF変換が有効かチェック
             if (std::isfinite(map_centroid.x) && std::isfinite(map_centroid.y) && std::isfinite(map_centroid.z)) {
@@ -474,7 +476,7 @@ std::vector<Cluster> ObstacleTrackerNode::clusterPoints(const std::vector<Point3
     return clusters;
 }
 
-std::vector<Cluster> ObstacleTrackerNode::adaptiveDBSCANCluster(const std::vector<Point3D>& points)
+std::vector<Cluster> ObstacleTrackerNode::adaptiveDBSCANCluster(const std::vector<Point3D>& points, const rclcpp::Time& timestamp)
 {
     std::vector<Cluster> clusters;
     if (points.empty()) return clusters;
@@ -540,8 +542,7 @@ std::vector<Cluster> ObstacleTrackerNode::adaptiveDBSCANCluster(const std::vecto
             }
             
             Point3D laser_centroid = calculateCentroid(cluster.points);
-            const rclcpp::Time current_time = this->now(); // TF変換用時刻キャッシュ
-            cluster.centroid = transformPointToMap(laser_centroid, "lidar_link", current_time);
+            cluster.centroid = transformPointToMap(laser_centroid, "lidar_link", timestamp);
             clusters.push_back(cluster);
         }
     }
@@ -650,7 +651,7 @@ void ObstacleTrackerNode::classifyClusters(std::vector<Cluster>& clusters)
     }
 }
 
-void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters)
+void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters, const rclcpp::Time& timestamp)
 {
     std::vector<Cluster> dynamic_clusters, static_clusters;
     
@@ -663,25 +664,25 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters)
         }
     }
     
-    // MarkerArrayを作成して配信
-    auto dynamic_markers = createMarkerArray(dynamic_clusters, true);
-    auto static_markers = createMarkerArray(static_clusters, false);
+    // MarkerArrayを作成して配信（統一された時刻使用）
+    auto dynamic_markers = createMarkerArray(dynamic_clusters, true, timestamp);
+    auto static_markers = createMarkerArray(static_clusters, false, timestamp);
     
     // 古いマーカーをクリアするためのマーカーを追加
-    addClearMarkers(dynamic_markers, "dynamic_obstacles");
-    addClearMarkers(static_markers, "static_obstacles");
+    addClearMarkers(dynamic_markers, "dynamic_obstacles", timestamp);
+    addClearMarkers(static_markers, "static_obstacles", timestamp);
     
     dynamic_obstacles_publisher_->publish(dynamic_markers);
     static_obstacles_publisher_->publish(static_markers);
     
-    // 楕円マーカーを作成して配信
+    // 楕円マーカーを作成して配信（統一された時刻使用）
     if (enable_ellipse_markers_) {
-        auto dynamic_ellipses = createEllipseMarkers(dynamic_clusters, true);
-        auto static_ellipses = createEllipseMarkers(static_clusters, false);
+        auto dynamic_ellipses = createEllipseMarkers(dynamic_clusters, true, timestamp);
+        auto static_ellipses = createEllipseMarkers(static_clusters, false, timestamp);
         
         // 楕円マーカーの古いマーカーもクリア
-        addClearMarkers(dynamic_ellipses, "dynamic_ellipses");
-        addClearMarkers(static_ellipses, "static_ellipses");
+        addClearMarkers(dynamic_ellipses, "dynamic_ellipses", timestamp);
+        addClearMarkers(static_ellipses, "static_ellipses", timestamp);
         
         dynamic_ellipse_publisher_->publish(dynamic_ellipses);
         static_ellipse_publisher_->publish(static_ellipses);
@@ -692,21 +693,20 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters)
 }
 
 visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createMarkerArray(
-    const std::vector<Cluster>& clusters, bool is_dynamic)
+    const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp)
 {
     visualization_msgs::msg::MarkerArray marker_array;
     int marker_id = 1; // 0はクリアマーカー用に予約
     
     for (const auto& cluster : clusters) {
         // クラスタ内の各点（ボクセル）に対して四角形マーカーを作成
-        const rclcpp::Time current_time = this->now(); // TF変換用時刻キャッシュ
         for (const auto& point : cluster.points) {
-            // 各ボクセルの位置をmapフレームに変換（キャッシュした時刻使用）
-            Point3D map_point = transformPointToMap(point, "lidar_link", current_time);
+            // 各ボクセルの位置をmapフレームに変換（統一された時刻使用）
+            Point3D map_point = transformPointToMap(point, "lidar_link", timestamp);
             
             visualization_msgs::msg::Marker marker;
             marker.header.frame_id = "map";
-            marker.header.stamp = this->now();
+            marker.header.stamp = timestamp;  // 統一された時刻を使用
             marker.ns = is_dynamic ? "dynamic_obstacles" : "static_obstacles";
             marker.id = marker_id++; // 各ボクセルに一意のID
             marker.type = visualization_msgs::msg::Marker::CUBE; // 四角形（立方体）
@@ -754,19 +754,21 @@ double ObstacleTrackerNode::calculateDistance(const Point3D& p1, const Point3D& 
 Point3D ObstacleTrackerNode::calculateCentroid(const std::vector<Point3D>& points)
 {
     if (points.empty()) {
-        return Point3D(0, 0, 0);
+        return Point3D(0, 0, 0, 0);
     }
     
-    Point3D centroid(0, 0, 0);
+    Point3D centroid(0, 0, 0, 0);
     for (const auto& point : points) {
         centroid.x += point.x;
         centroid.y += point.y;
         centroid.z += point.z;
+        centroid.angle += point.angle;
     }
     
     centroid.x /= points.size();
     centroid.y /= points.size();
     centroid.z /= points.size();
+    centroid.angle /= points.size();
     
     return centroid;
 }
@@ -793,7 +795,8 @@ Point3D ObstacleTrackerNode::transformPointToMap(const Point3D& point, const std
             tf_buffer_->lookupTransform("map", source_frame, tf2::TimePointZero);
         tf2::doTransform(point_in, point_out, transform);
         
-        return Point3D(point_out.point.x, point_out.point.y, point_out.point.z);
+        return Point3D(point_out.point.x, point_out.point.y, point_out.point.z, 
+                       std::atan2(point_out.point.y, point_out.point.x));
         
     } catch (const tf2::TransformException& ex) {
         // より詳細なエラー情報をログ出力
@@ -864,12 +867,10 @@ double ObstacleTrackerNode::getAdaptiveEps(const Point3D& point)
 
 double ObstacleTrackerNode::calculateAngularDifference(const Point3D& p1, const Point3D& p2)
 {
-    // ロボット中心からの角度を計算
-    double angle1 = std::atan2(p1.y, p1.x);
-    double angle2 = std::atan2(p2.y, p2.x);
+    // 元のLiDAR角度情報を直接使用（atan2()による逆算を回避）
+    double diff = p2.angle - p1.angle;
     
     // 角度差を計算（-π to π の範囲に正規化）
-    double diff = angle2 - angle1;
     while (diff > M_PI) diff -= 2.0 * M_PI;
     while (diff < -M_PI) diff += 2.0 * M_PI;
     
@@ -881,15 +882,19 @@ std::vector<int> ObstacleTrackerNode::getNeighbors(int point_idx, const std::vec
     std::vector<int> neighbors;
     const Point3D& query_point = points[point_idx];
     double adaptive_eps = getAdaptiveEps(query_point);
+    double adaptive_eps_squared = adaptive_eps * adaptive_eps;  // 事前計算で効率化
     
     for (size_t i = 0; i < points.size(); ++i) {
         if (i == static_cast<size_t>(point_idx)) continue;
         
         const Point3D& candidate = points[i];
         
-        // 空間距離チェック
-        double spatial_distance = calculateDistance(query_point, candidate);
-        if (spatial_distance > adaptive_eps) continue;
+        // 空間距離チェック（平方距離で高速化）
+        double dx = query_point.x - candidate.x;
+        double dy = query_point.y - candidate.y;
+        double dz = query_point.z - candidate.z;
+        double distance_squared = dx * dx + dy * dy + dz * dz;
+        if (distance_squared > adaptive_eps_squared) continue;
         
         // 角度差チェック（近い点同士のみ）
         double angular_diff = calculateAngularDifference(query_point, candidate);
@@ -908,7 +913,7 @@ bool ObstacleTrackerNode::isCore(int point_idx, const std::vector<Point3D>& poin
 }
 
 visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
-    const std::vector<Cluster>& clusters, bool is_dynamic)
+    const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp)
 {
     visualization_msgs::msg::MarkerArray marker_array;
     int marker_id = 1; // 0はクリアマーカー用に予約
@@ -921,21 +926,20 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
         
         visualization_msgs::msg::Marker marker;
         marker.header.frame_id = "map";
-        marker.header.stamp = this->now();
+        marker.header.stamp = timestamp;  // 統一された時刻を使用
         marker.ns = is_dynamic ? "dynamic_ellipses" : "static_ellipses";
         marker.id = marker_id++; // 連番でID割り当て
         marker.type = visualization_msgs::msg::Marker::CYLINDER; // 楕円は円柱で近似
         marker.action = visualization_msgs::msg::Marker::ADD;
         
-        // 位置設定（楕円中心をmapフレームに変換）
-        const rclcpp::Time current_time = this->now(); // TF変換用時刻キャッシュ
-        Point3D map_center = transformPointToMap(ellipse.center, "lidar_link", current_time);
+        // 位置設定（楕円中心をmapフレームに変換、統一された時刻使用）
+        Point3D map_center = transformPointToMap(ellipse.center, "lidar_link", timestamp);
         marker.pose.position.x = map_center.x;
         marker.pose.position.y = map_center.y;
         marker.pose.position.z = map_center.z;
         
-        // 楕円の向きをロボットの回転に合わせて変換
-        double map_orientation = transformOrientationToMap(ellipse.orientation, current_time);
+        // 楕円の向きをロボットの回転に合わせて変換（統一された時刻使用）
+        double map_orientation = transformOrientationToMap(ellipse.orientation, timestamp);
         
         // 回転設定（Z軸回りの回転）
         marker.pose.orientation.x = 0.0;
@@ -978,7 +982,7 @@ ObstacleTrackerNode::EllipseParams ObstacleTrackerNode::calculateClusterEllipse(
     
     if (points.size() < 2) {
         // 点数が少ない場合は小さな円として扱う
-        ellipse.center = points.empty() ? Point3D(0, 0, 0) : calculateCentroid(points);
+        ellipse.center = points.empty() ? Point3D(0, 0, 0, 0) : calculateCentroid(points);
         ellipse.semi_major_axis = MIN_AXIS_LENGTH;
         ellipse.semi_minor_axis = MIN_AXIS_LENGTH;
         ellipse.orientation = 0.0;
@@ -1103,12 +1107,12 @@ double ObstacleTrackerNode::transformOrientationToMap(double lidar_orientation, 
 }
 
 void ObstacleTrackerNode::addClearMarkers(visualization_msgs::msg::MarkerArray& marker_array, 
-                                         const std::string& namespace_name)
+                                         const std::string& namespace_name, const rclcpp::Time& timestamp)
 {
     // DELETEALLマーカーを先頭に追加して、古いマーカーをクリア
     visualization_msgs::msg::Marker clear_marker;
     clear_marker.header.frame_id = "map";
-    clear_marker.header.stamp = this->now();
+    clear_marker.header.stamp = timestamp;  // 統一された時刻を使用
     clear_marker.ns = namespace_name;
     clear_marker.id = 0;
     clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;

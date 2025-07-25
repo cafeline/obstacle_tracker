@@ -20,7 +20,9 @@ namespace obstacle_tracker
 struct Point3D
 {
     double x, y, z;
-    Point3D(double x = 0.0, double y = 0.0, double z = 0.0) : x(x), y(y), z(z) {}
+    double angle;  // LiDARからの角度情報（ラジアン）
+    Point3D(double x = 0.0, double y = 0.0, double z = 0.0, double angle = 0.0) 
+        : x(x), y(y), z(z), angle(angle) {}
 };
 
 struct Cluster
@@ -47,19 +49,19 @@ private:
     // データ処理関数
     std::vector<Point3D> convertScanToPoints(const sensor_msgs::msg::LaserScan::SharedPtr scan);
     std::vector<Point3D> voxelizePoints(const std::vector<Point3D>& points);
-    std::vector<Cluster> clusterPoints(const std::vector<Point3D>& voxelized_points);
-    std::vector<Cluster> adaptiveDBSCANCluster(const std::vector<Point3D>& points);
+    std::vector<Cluster> clusterPoints(const std::vector<Point3D>& voxelized_points, const rclcpp::Time& timestamp);
+    std::vector<Cluster> adaptiveDBSCANCluster(const std::vector<Point3D>& points, const rclcpp::Time& timestamp);
     void trackClusters(std::vector<Cluster>& clusters);
     void classifyClusters(std::vector<Cluster>& clusters);
     
     // 出力関数
-    void publishObstacles(const std::vector<Cluster>& clusters);
+    void publishObstacles(const std::vector<Cluster>& clusters, const rclcpp::Time& timestamp);
     visualization_msgs::msg::MarkerArray createMarkerArray(
-        const std::vector<Cluster>& clusters, bool is_dynamic);
+        const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp);
     visualization_msgs::msg::MarkerArray createEllipseMarkers(
-        const std::vector<Cluster>& clusters, bool is_dynamic);
+        const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp);
     void addClearMarkers(visualization_msgs::msg::MarkerArray& marker_array, 
-                        const std::string& namespace_name);
+                        const std::string& namespace_name, const rclcpp::Time& timestamp);
     
     // ユーティリティ関数
     double calculateDistance(const Point3D& p1, const Point3D& p2);

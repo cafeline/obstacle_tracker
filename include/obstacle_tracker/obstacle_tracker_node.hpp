@@ -30,11 +30,15 @@ struct Cluster
     std::vector<Point3D> points;
     Point3D centroid;
     Point3D velocity;
+    Point3D smoothed_velocity;  // 平滑化された速度
     int id;
     bool is_dynamic;
     int track_count;
+    double confidence;  // 追跡信頼度 (0.0-1.0)
+    int missing_count;  // 検出されなかった連続フレーム数
     
-    Cluster() : centroid(0, 0, 0), velocity(0, 0, 0), id(0), is_dynamic(false), track_count(0) {}
+    Cluster() : centroid(0, 0, 0), velocity(0, 0, 0), smoothed_velocity(0, 0, 0), 
+                id(0), is_dynamic(false), track_count(0), confidence(0.0), missing_count(0) {}
 };
 
 class ObstacleTrackerNode : public rclcpp::Node
@@ -52,6 +56,7 @@ private:
     std::vector<Cluster> clusterPoints(const std::vector<Point3D>& voxelized_points, const rclcpp::Time& timestamp);
     std::vector<Cluster> adaptiveDBSCANCluster(const std::vector<Point3D>& points, const rclcpp::Time& timestamp);
     void trackClusters(std::vector<Cluster>& clusters);
+    void enhancedTrackClusters(std::vector<Cluster>& clusters);  // 改善された追跡
     void classifyClusters(std::vector<Cluster>& clusters);
     
     // 出力関数
@@ -74,6 +79,11 @@ private:
     
     // パラメータ検証
     void validateParameters();
+    
+    // 改善された追跡関連
+    double calculateMatchingScore(const Cluster& prev, const Cluster& curr, double dt);
+    Point3D smoothVelocity(const Point3D& prev_vel, const Point3D& measured_vel, double alpha);
+    void updateClusterConfidence(Cluster& cluster, bool matched);
     
     // Adaptive DBSCAN関連
     double getAdaptiveEps(const Point3D& point);
@@ -116,6 +126,12 @@ private:
     // 楕円表示パラメータ
     bool enable_ellipse_markers_;     // 楕円マーカー有効/無効
     double ellipse_scale_factor_;     // 楕円スケール係数
+    
+    // 改善された追跡パラメータ
+    bool enable_enhanced_tracking_;   // 改善された追跡の有効/無効
+    double velocity_smoothing_alpha_; // 速度平滑化係数 (0.0-1.0)
+    double confidence_decay_rate_;    // 信頼度減衰率
+    int max_missing_frames_;          // 最大欠測フレーム数
     
     // パラメータ検証用定数
     static constexpr double MIN_PROCESSING_RANGE = 0.1;

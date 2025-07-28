@@ -38,6 +38,12 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     this->declare_parameter("enable_ellipse_markers", true);
     this->declare_parameter("ellipse_scale_factor", 1.2);
     
+    // 改善された追跡パラメータ
+    this->declare_parameter("enable_enhanced_tracking", true);
+    this->declare_parameter("velocity_smoothing_alpha", 0.3);
+    this->declare_parameter("confidence_decay_rate", 0.1);
+    this->declare_parameter("max_missing_frames", 5);
+    
     // パラメータの取得
     robot_processing_range_ = this->get_parameter("robot_processing_range").as_double();
     dynamic_cluster_speed_threshold_ = this->get_parameter("dynamic_cluster_speed_threshold").as_double();
@@ -57,6 +63,12 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     // 楕円表示パラメータ取得
     enable_ellipse_markers_ = this->get_parameter("enable_ellipse_markers").as_bool();
     ellipse_scale_factor_ = this->get_parameter("ellipse_scale_factor").as_double();
+    
+    // 改善された追跡パラメータ取得
+    enable_enhanced_tracking_ = this->get_parameter("enable_enhanced_tracking").as_bool();
+    velocity_smoothing_alpha_ = this->get_parameter("velocity_smoothing_alpha").as_double();
+    confidence_decay_rate_ = this->get_parameter("confidence_decay_rate").as_double();
+    max_missing_frames_ = this->get_parameter("max_missing_frames").as_int();
     
     // パラメータ検証
     validateParameters();
@@ -258,7 +270,11 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
             adaptiveDBSCANCluster(voxelized_points, current_time) : clusterPoints(voxelized_points, current_time);
         
         // 4. クラスタ追跡
-        trackClusters(clusters);
+        if (enable_enhanced_tracking_) {
+            enhancedTrackClusters(clusters);
+        } else {
+            trackClusters(clusters);
+        }
         
         // 5. 動的・静的分類
         classifyClusters(clusters);
@@ -642,12 +658,19 @@ void ObstacleTrackerNode::trackClusters(std::vector<Cluster>& clusters)
 void ObstacleTrackerNode::classifyClusters(std::vector<Cluster>& clusters)
 {
     for (auto& cluster : clusters) {
+        // 改善された追跡が有効な場合は平滑化された速度を使用
+        Point3D velocity_to_use = enable_enhanced_tracking_ ? cluster.smoothed_velocity : cluster.velocity;
+        
         // 速度ベクトルの大きさを計算
-        double speed = std::sqrt(cluster.velocity.x * cluster.velocity.x +
-                                cluster.velocity.y * cluster.velocity.y);
+        double speed = std::sqrt(velocity_to_use.x * velocity_to_use.x +
+                                velocity_to_use.y * velocity_to_use.y);
         
         // しきい値と比較して動的・静的を判別
         cluster.is_dynamic = (speed > dynamic_cluster_speed_threshold_);
+        
+        RCLCPP_DEBUG(this->get_logger(), 
+            "Cluster %d: speed=%.2f m/s, dynamic=%s, confidence=%.2f", 
+            cluster.id, speed, cluster.is_dynamic ? "true" : "false", cluster.confidence);
     }
 }
 
@@ -1123,6 +1146,202 @@ void ObstacleTrackerNode::addClearMarkers(visualization_msgs::msg::MarkerArray& 
     // 既存マーカーのIDを1から開始するように調整
     for (size_t i = 1; i < marker_array.markers.size(); ++i) {
         marker_array.markers[i].id = static_cast<int>(i);
+    }
+}
+
+// 改善された追跡アルゴリズム
+void ObstacleTrackerNode::enhancedTrackClusters(std::vector<Cluster>& clusters)
+{
+    // ロボットの現在速度を取得（キャッシュ）
+    static Point3D cached_robot_velocity(0, 0, 0);
+    static rclcpp::Time last_velocity_update;
+    
+    rclcpp::Time current_time = this->now();
+    static double last_velocity_update_sec = 0.0;
+    double current_time_sec = current_time.seconds();
+    
+    if (last_velocity_update_sec == 0.0 || 
+        (current_time_sec - last_velocity_update_sec) > 0.05) { // 20Hzで更新
+        cached_robot_velocity = getRobotVelocity();
+        last_velocity_update_sec = current_time_sec;
+    }
+    
+    // 時間差分計算
+    double dt = 0.1; // デフォルト値
+    double last_scan_time_sec = last_scan_time_.seconds();
+    
+    if (last_scan_time_sec > 0.0) {
+        dt = current_time_sec - last_scan_time_sec;
+    }
+    if (dt <= 0.001 || dt > 1.0) {
+        dt = 0.1; // 異常な時間差分の場合はデフォルト値を使用
+    }
+    
+    // マッチングマトリックスの計算
+    std::vector<std::vector<double>> matching_scores;
+    matching_scores.resize(previous_clusters_.size());
+    
+    std::vector<int> prev_cluster_ids;
+    for (const auto& [id, cluster] : previous_clusters_) {
+        prev_cluster_ids.push_back(id);
+    }
+    
+    for (size_t i = 0; i < prev_cluster_ids.size(); ++i) {
+        matching_scores[i].resize(clusters.size());
+        const auto& prev_cluster = previous_clusters_[prev_cluster_ids[i]];
+        
+        for (size_t j = 0; j < clusters.size(); ++j) {
+            matching_scores[i][j] = calculateMatchingScore(prev_cluster, clusters[j], dt);
+        }
+    }
+    
+    // シンプルなGreedy matching（Hungarian algorithmの代替）
+    std::vector<bool> prev_matched(prev_cluster_ids.size(), false);
+    std::vector<bool> curr_matched(clusters.size(), false);
+    
+    // 高いスコアから順にマッチング
+    for (int iteration = 0; iteration < static_cast<int>(std::min(prev_cluster_ids.size(), clusters.size())); ++iteration) {
+        double best_score = -1.0;
+        int best_prev_idx = -1;
+        int best_curr_idx = -1;
+        
+        for (size_t i = 0; i < prev_cluster_ids.size(); ++i) {
+            if (prev_matched[i]) continue;
+            
+            for (size_t j = 0; j < clusters.size(); ++j) {
+                if (curr_matched[j]) continue;
+                
+                if (matching_scores[i][j] > best_score) {
+                    best_score = matching_scores[i][j];
+                    best_prev_idx = i;
+                    best_curr_idx = j;
+                }
+            }
+        }
+        
+        // 最低スコア閾値チェック
+        if (best_score < 0.3) {
+            break; // スコアが低すぎる場合は残りはマッチングしない
+        }
+        
+        // マッチングを適用
+        if (best_prev_idx >= 0 && best_curr_idx >= 0) {
+            prev_matched[best_prev_idx] = true;
+            curr_matched[best_curr_idx] = true;
+            
+            const auto& prev_cluster = previous_clusters_[prev_cluster_ids[best_prev_idx]];
+            auto& curr_cluster = clusters[best_curr_idx];
+            
+            // IDを継承
+            curr_cluster.id = prev_cluster.id;
+            curr_cluster.track_count = prev_cluster.track_count + 1;
+            curr_cluster.missing_count = 0;
+            
+            // 速度計算
+            Point3D relative_velocity;
+            relative_velocity.x = (curr_cluster.centroid.x - prev_cluster.centroid.x) / dt;
+            relative_velocity.y = (curr_cluster.centroid.y - prev_cluster.centroid.y) / dt;
+            relative_velocity.z = 0.0;
+            
+            // ロボットの移動速度を差し引いて絶対速度を計算
+            curr_cluster.velocity.x = relative_velocity.x - cached_robot_velocity.x;
+            curr_cluster.velocity.y = relative_velocity.y - cached_robot_velocity.y;
+            curr_cluster.velocity.z = 0.0;
+            
+            // 速度平滑化
+            curr_cluster.smoothed_velocity = smoothVelocity(
+                prev_cluster.smoothed_velocity, curr_cluster.velocity, velocity_smoothing_alpha_);
+            
+            // 信頼度更新
+            updateClusterConfidence(curr_cluster, true);
+            
+            RCLCPP_DEBUG(this->get_logger(), 
+                "Enhanced tracking - Cluster %d matched with score %.3f, confidence %.2f",
+                curr_cluster.id, best_score, curr_cluster.confidence);
+        }
+    }
+    
+    // マッチングされなかった現在のクラスタは新規として扱う
+    for (size_t j = 0; j < clusters.size(); ++j) {
+        if (!curr_matched[j]) {
+            clusters[j].id = next_cluster_id_++;
+            clusters[j].velocity = Point3D(0, 0, 0);
+            clusters[j].smoothed_velocity = Point3D(0, 0, 0);
+            clusters[j].track_count = 1;
+            clusters[j].confidence = 0.5; // 初期信頼度
+            clusters[j].missing_count = 0;
+            
+            RCLCPP_DEBUG(this->get_logger(), 
+                "Enhanced tracking - New cluster %d created", clusters[j].id);
+        }
+    }
+    
+    // 現在のクラスタを保存
+    previous_clusters_.clear();
+    for (const auto& cluster : clusters) {
+        previous_clusters_.emplace(cluster.id, cluster);
+    }
+}
+
+double ObstacleTrackerNode::calculateMatchingScore(const Cluster& prev, const Cluster& curr, double dt)
+{
+    // 1. 位置距離スコア
+    double dx = curr.centroid.x - prev.centroid.x;
+    double dy = curr.centroid.y - prev.centroid.y;
+    double position_distance = std::sqrt(dx * dx + dy * dy);
+    double position_score = std::exp(-position_distance / 1.0); // 1m で大幅減衰
+    
+    // 2. サイズ類似度スコア
+    double prev_size = static_cast<double>(prev.points.size());
+    double curr_size = static_cast<double>(curr.points.size());
+    if (prev_size < 1.0) prev_size = 1.0; // ゼロ除算防止
+    
+    double size_ratio = curr_size / prev_size;
+    if (size_ratio > 1.0) size_ratio = 1.0 / size_ratio; // 0-1に正規化
+    double size_score = size_ratio;
+    
+    // 3. 予測位置との一致度スコア
+    Point3D predicted_pos;
+    predicted_pos.x = prev.centroid.x + prev.smoothed_velocity.x * dt;
+    predicted_pos.y = prev.centroid.y + prev.smoothed_velocity.y * dt;
+    
+    double pred_dx = curr.centroid.x - predicted_pos.x;
+    double pred_dy = curr.centroid.y - predicted_pos.y;
+    double prediction_error = std::sqrt(pred_dx * pred_dx + pred_dy * pred_dy);
+    double prediction_score = std::exp(-prediction_error / 0.5); // 0.5m で大幅減衰
+    
+    // 4. 信頼度による重み付け
+    double confidence_weight = std::max(0.3, prev.confidence);
+    
+    // 重み付き統合スコア
+    double total_score = confidence_weight * (
+        0.5 * position_score + 
+        0.2 * size_score + 
+        0.3 * prediction_score
+    );
+    
+    return total_score;
+}
+
+Point3D ObstacleTrackerNode::smoothVelocity(const Point3D& prev_vel, const Point3D& measured_vel, double alpha)
+{
+    Point3D smooth_vel;
+    smooth_vel.x = alpha * measured_vel.x + (1.0 - alpha) * prev_vel.x;
+    smooth_vel.y = alpha * measured_vel.y + (1.0 - alpha) * prev_vel.y;
+    smooth_vel.z = 0.0;
+    return smooth_vel;
+}
+
+void ObstacleTrackerNode::updateClusterConfidence(Cluster& cluster, bool matched)
+{
+    if (matched) {
+        // マッチングされた場合、信頼度を向上
+        cluster.confidence = std::min(1.0, cluster.confidence + 0.1);
+        cluster.missing_count = 0;
+    } else {
+        // マッチングされなかった場合、信頼度を減衰
+        cluster.confidence = std::max(0.0, cluster.confidence - confidence_decay_rate_);
+        cluster.missing_count++;
     }
 }
 

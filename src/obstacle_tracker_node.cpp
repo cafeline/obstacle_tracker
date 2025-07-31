@@ -740,8 +740,13 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createConnectedMarkerA
         
         // 連結された各点に対してマーカーを作成
         for (const auto& point : connected_points) {
-            // mapフレームに変換してからボクセル位置を計算
-            Point3D map_point = transformPointToMap(point, "lidar_link", timestamp);
+            // スライディングウィンドウ有効時は既にmapフレーム座標、無効時は変換が必要
+            Point3D map_point;
+            if (enable_sliding_window_) {
+                map_point = point;  // 既にmapフレーム座標
+            } else {
+                map_point = transformPointToMap(point, "lidar_link", timestamp);
+            }
             
             // ボクセル位置で重複チェック（mapフレーム座標で）
             int vx = static_cast<int>(std::round(map_point.x / voxel_size_));
@@ -881,20 +886,23 @@ void ObstacleTrackerNode::updateSlidingWindow(const std::vector<Point3D>& points
         frame_timestamps_.pop_front();
     }
     
-    // ボクセル履歴を更新
+    // ボクセル履歴を更新（mapフレームに変換して保存）
     for (const auto& point : points) {
-        // ボクセル位置を計算
-        int vx = static_cast<int>(std::round(point.x / voxel_size_));
-        int vy = static_cast<int>(std::round(point.y / voxel_size_));
-        int vz = static_cast<int>(std::round(point.z / voxel_size_));
+        // 各点をmapフレームに変換（観測時点のTF使用）
+        Point3D map_point = transformPointToMap(point, "lidar_link", timestamp);
+        
+        // mapフレーム座標でボクセル位置を計算
+        int vx = static_cast<int>(std::round(map_point.x / voxel_size_));
+        int vy = static_cast<int>(std::round(map_point.y / voxel_size_));
+        int vz = static_cast<int>(std::round(map_point.z / voxel_size_));
         
         auto voxel_key = std::make_tuple(vx, vy, vz);
         
-        // 観測記録を追加
+        // 観測記録を追加（mapフレーム座標で保存）
         VoxelObservation obs;
-        obs.position = point;
+        obs.position = map_point;  // mapフレーム座標を保存
         obs.timestamp = timestamp;
-        obs.angle = point.angle;
+        obs.angle = point.angle;    // 元の角度情報は保持
         
         voxel_history_[voxel_key].push_back(obs);
     }
@@ -913,12 +921,13 @@ std::vector<Point3D> ObstacleTrackerNode::getAggregatedPoints() const
     // 各ボクセルの観測回数をチェックして、閾値以上のもののみを含める
     for (const auto& [voxel_key, observations] : voxel_history_) {
         if (static_cast<int>(observations.size()) >= min_voxel_observations_) {
-            // 最新の観測を代表点として使用
+            // 最新の観測を代表点として使用（既にmapフレーム座標）
             if (!observations.empty()) {
                 auto latest_obs = std::max_element(observations.begin(), observations.end(),
                     [](const VoxelObservation& a, const VoxelObservation& b) {
                         return a.timestamp < b.timestamp;
                     });
+                // 既にmapフレーム座標なのでそのまま使用
                 aggregated_points.push_back(latest_obs->position);
             }
         }

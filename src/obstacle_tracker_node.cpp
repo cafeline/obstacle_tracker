@@ -34,9 +34,6 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     this->declare_parameter("distance_adaptive_factor", 0.05);
     this->declare_parameter("max_angular_difference", 0.2);
     
-    // 楕円表示パラメータ
-    this->declare_parameter("enable_ellipse_markers", true);
-    this->declare_parameter("ellipse_scale_factor", 1.2);
     
     // 改善された追跡パラメータ
     this->declare_parameter("enable_enhanced_tracking", true);
@@ -60,9 +57,6 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     distance_adaptive_factor_ = this->get_parameter("distance_adaptive_factor").as_double();
     max_angular_difference_ = this->get_parameter("max_angular_difference").as_double();
     
-    // 楕円表示パラメータ取得
-    enable_ellipse_markers_ = this->get_parameter("enable_ellipse_markers").as_bool();
-    ellipse_scale_factor_ = this->get_parameter("ellipse_scale_factor").as_double();
     
     // 改善された追跡パラメータ取得
     enable_enhanced_tracking_ = this->get_parameter("enable_enhanced_tracking").as_bool();
@@ -83,11 +77,6 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     static_obstacles_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/static_obstacles", 10);
     
-    // 楕円マーカー用パブリッシャー
-    dynamic_ellipse_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-        "/dynamic_ellipses", 10);
-    static_ellipse_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-        "/static_ellipses", 10);
     
     RCLCPP_INFO(this->get_logger(), "ObstacleTracker node initialized with validated parameters");
     RCLCPP_INFO(this->get_logger(), "Processing range: %.2f m", robot_processing_range_);
@@ -99,7 +88,6 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
         RCLCPP_INFO(this->get_logger(), "DBSCAN params - base_eps: %.2f, min_points: %d, adaptive_factor: %.3f", 
                    dbscan_base_eps_, dbscan_min_points_, distance_adaptive_factor_);
     }
-    RCLCPP_INFO(this->get_logger(), "Ellipse markers: %s", enable_ellipse_markers_ ? "enabled" : "disabled");
 }
 
 void ObstacleTrackerNode::validateParameters()
@@ -179,12 +167,6 @@ void ObstacleTrackerNode::validateParameters()
         params_valid = false;
     }
     
-    // 楕円表示関連パラメータの検証
-    if (ellipse_scale_factor_ <= MIN_ELLIPSE_SCALE || ellipse_scale_factor_ > MAX_ELLIPSE_SCALE) {
-        error_messages.push_back("Invalid ellipse_scale_factor: " + std::to_string(ellipse_scale_factor_) + 
-                               " (must be " + std::to_string(MIN_ELLIPSE_SCALE) + " < value <= " + std::to_string(MAX_ELLIPSE_SCALE) + ")");
-        params_valid = false;
-    }
     
     // パラメータ整合性チェック（警告）
     if (clustering_max_distance_ < voxel_size_) {
@@ -687,9 +669,9 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters,
         }
     }
     
-    // MarkerArrayを作成して配信（統一された時刻使用）
-    auto dynamic_markers = createMarkerArray(dynamic_clusters, true, timestamp);
-    auto static_markers = createMarkerArray(static_clusters, false, timestamp);
+    // 連結されたマーカー配列を作成（隙間を埋める）
+    auto dynamic_markers = createConnectedMarkerArray(dynamic_clusters, true, timestamp);
+    auto static_markers = createConnectedMarkerArray(static_clusters, false, timestamp);
     
     // 古いマーカーをクリアするためのマーカーを追加
     addClearMarkers(dynamic_markers, "dynamic_obstacles", timestamp);
@@ -698,21 +680,116 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters,
     dynamic_obstacles_publisher_->publish(dynamic_markers);
     static_obstacles_publisher_->publish(static_markers);
     
-    // 楕円マーカーを作成して配信（統一された時刻使用）
-    if (enable_ellipse_markers_) {
-        auto dynamic_ellipses = createEllipseMarkers(dynamic_clusters, true, timestamp);
-        auto static_ellipses = createEllipseMarkers(static_clusters, false, timestamp);
-        
-        // 楕円マーカーの古いマーカーもクリア
-        addClearMarkers(dynamic_ellipses, "dynamic_ellipses", timestamp);
-        addClearMarkers(static_ellipses, "static_ellipses", timestamp);
-        
-        dynamic_ellipse_publisher_->publish(dynamic_ellipses);
-        static_ellipse_publisher_->publish(static_ellipses);
-    }
     
     RCLCPP_DEBUG(this->get_logger(), "Published %zu dynamic and %zu static clusters",
                 dynamic_clusters.size(), static_clusters.size());
+}
+
+visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createConnectedMarkerArray(
+    const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp)
+{
+    visualization_msgs::msg::MarkerArray marker_array;
+    int marker_id = 1; // 0はクリアマーカー用に予約
+    
+    for (const auto& cluster : clusters) {
+        // クラスタ内の点を連結して隙間を埋める
+        auto connected_points = fillGapsInCluster(cluster);
+        
+        // 連結された各点に対してマーカーを作成
+        for (const auto& point : connected_points) {
+            // 各ボクセルの位置をmapフレームに変換
+            Point3D map_point = transformPointToMap(point, "lidar_link", timestamp);
+            
+            visualization_msgs::msg::Marker marker;
+            marker.header.frame_id = "map";
+            marker.header.stamp = timestamp;
+            marker.ns = is_dynamic ? "dynamic_obstacles" : "static_obstacles";
+            marker.id = marker_id++;
+            marker.type = visualization_msgs::msg::Marker::CUBE;
+            marker.action = visualization_msgs::msg::Marker::ADD;
+            
+            // 位置設定
+            marker.pose.position.x = map_point.x;
+            marker.pose.position.y = map_point.y;
+            marker.pose.position.z = map_point.z;
+            marker.pose.orientation.w = 1.0;
+            
+            // サイズ設定
+            marker.scale.x = voxel_size_;
+            marker.scale.y = voxel_size_;
+            marker.scale.z = voxel_size_;
+            
+            // 色設定
+            if (is_dynamic) {
+                marker.color.r = 1.0; // 動的障害物は赤
+                marker.color.g = 0.0;
+                marker.color.b = 0.0;
+                marker.color.a = 0.7;
+            } else {
+                marker.color.r = 0.0; // 静的障害物は青
+                marker.color.g = 0.0;
+                marker.color.b = 1.0;
+                marker.color.a = 0.7;
+            }
+            
+            marker.lifetime = rclcpp::Duration::from_seconds(1.2);
+            marker_array.markers.push_back(marker);
+        }
+    }
+    
+    return marker_array;
+}
+
+std::vector<Point3D> ObstacleTrackerNode::fillGapsInCluster(const Cluster& cluster)
+{
+    std::vector<Point3D> filled_points = cluster.points;
+    
+    if (cluster.points.size() < 2) {
+        return filled_points; // 点が少なすぎる場合はそのまま返す
+    }
+    
+    // クラスタ内の各点間の距離をチェックし、隙間を埋める
+    std::vector<Point3D> additional_points;
+    
+    for (size_t i = 0; i < cluster.points.size(); ++i) {
+        for (size_t j = i + 1; j < cluster.points.size(); ++j) {
+            const Point3D& p1 = cluster.points[i];
+            const Point3D& p2 = cluster.points[j];
+            
+            // 2点間の距離を計算
+            double distance = std::sqrt(
+                (p2.x - p1.x) * (p2.x - p1.x) +
+                (p2.y - p1.y) * (p2.y - p1.y) +
+                (p2.z - p1.z) * (p2.z - p1.z)
+            );
+            
+            // 隙間がvoxel_sizeの1.5倍より大きい場合、補間点を追加
+            double gap_threshold = voxel_size_ * 1.5;
+            if (distance > gap_threshold && distance < voxel_size_ * 3.0) { // 最大3倍まで
+                // 必要な補間点数を計算
+                int num_interpolations = static_cast<int>(std::ceil(distance / voxel_size_)) - 1;
+                
+                for (int k = 1; k <= num_interpolations; ++k) {
+                    double t = static_cast<double>(k) / (num_interpolations + 1);
+                    
+                    Point3D interpolated_point;
+                    interpolated_point.x = p1.x + t * (p2.x - p1.x);
+                    interpolated_point.y = p1.y + t * (p2.y - p1.y);
+                    interpolated_point.z = p1.z + t * (p2.z - p1.z);
+                    
+                    additional_points.push_back(interpolated_point);
+                }
+            }
+        }
+    }
+    
+    // 元の点と補間点を結合
+    filled_points.insert(filled_points.end(), additional_points.begin(), additional_points.end());
+    
+    RCLCPP_DEBUG(this->get_logger(), "Cluster gap filling: original=%zu, filled=%zu (+%zu)", 
+                cluster.points.size(), filled_points.size(), additional_points.size());
+    
+    return filled_points;
 }
 
 visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createMarkerArray(
@@ -935,199 +1012,8 @@ bool ObstacleTrackerNode::isCore(int point_idx, const std::vector<Point3D>& poin
     return neighbors.size() >= static_cast<size_t>(dbscan_min_points_);
 }
 
-visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createEllipseMarkers(
-    const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp)
-{
-    visualization_msgs::msg::MarkerArray marker_array;
-    int marker_id = 1; // 0はクリアマーカー用に予約
-    
-    for (const auto& cluster : clusters) {
-        if (cluster.points.empty()) continue;
-        
-        // クラスタの楕円パラメータを計算
-        EllipseParams ellipse = calculateClusterEllipse(cluster.points);
-        
-        visualization_msgs::msg::Marker marker;
-        marker.header.frame_id = "map";
-        marker.header.stamp = timestamp;  // 統一された時刻を使用
-        marker.ns = is_dynamic ? "dynamic_ellipses" : "static_ellipses";
-        marker.id = marker_id++; // 連番でID割り当て
-        marker.type = visualization_msgs::msg::Marker::CYLINDER; // 楕円は円柱で近似
-        marker.action = visualization_msgs::msg::Marker::ADD;
-        
-        // 位置設定（楕円中心をmapフレームに変換、統一された時刻使用）
-        Point3D map_center = transformPointToMap(ellipse.center, "lidar_link", timestamp);
-        marker.pose.position.x = map_center.x;
-        marker.pose.position.y = map_center.y;
-        marker.pose.position.z = map_center.z;
-        
-        // 楕円の向きをロボットの回転に合わせて変換（統一された時刻使用）
-        double map_orientation = transformOrientationToMap(ellipse.orientation, timestamp);
-        
-        // 回転設定（Z軸回りの回転）
-        marker.pose.orientation.x = 0.0;
-        marker.pose.orientation.y = 0.0;
-        marker.pose.orientation.z = std::sin(map_orientation / 2.0);
-        marker.pose.orientation.w = std::cos(map_orientation / 2.0);
-        
-        // サイズ設定（楕円のサイズをスケール）
-        marker.scale.x = ellipse.semi_major_axis * 2.0 * ellipse_scale_factor_;
-        marker.scale.y = ellipse.semi_minor_axis * 2.0 * ellipse_scale_factor_;
-        marker.scale.z = 0.1; // 薄い円柱
-        
-        // 色設定（透明度を上げて境界線として表示）
-        if (is_dynamic) {
-            marker.color.r = 1.0; // 赤
-            marker.color.g = 0.0;
-            marker.color.b = 0.0;
-        } else {
-            marker.color.r = 0.0;
-            marker.color.g = 0.0;
-            marker.color.b = 1.0; // 青
-        }
-        marker.color.a = 0.3; // 透明度
-        
-        // 楕円マーカーを常時表示するため、lifetimeを0（永続）に設定
-        marker.lifetime = rclcpp::Duration::from_seconds(0.0);
-        marker_array.markers.push_back(marker);
-    }
-    
-    return marker_array;
-}
 
-ObstacleTrackerNode::EllipseParams ObstacleTrackerNode::calculateClusterEllipse(
-    const std::vector<Point3D>& points)
-{
-    EllipseParams ellipse;
-    const double EPSILON = 1e-10;
-    const double MIN_AXIS_LENGTH = 0.05;
-    const double MAX_AXIS_LENGTH = 10.0;
-    
-    if (points.size() < 2) {
-        // 点数が少ない場合は小さな円として扱う
-        ellipse.center = points.empty() ? Point3D(0, 0, 0, 0) : calculateCentroid(points);
-        ellipse.semi_major_axis = MIN_AXIS_LENGTH;
-        ellipse.semi_minor_axis = MIN_AXIS_LENGTH;
-        ellipse.orientation = 0.0;
-        return ellipse;
-    }
-    
-    // 重心を計算
-    ellipse.center = calculateCentroid(points);
-    
-    // 共分散行列を計算（数値安定性改善）
-    double cxx = 0.0, cyy = 0.0, cxy = 0.0;
-    double sum_weight = 0.0;
-    
-    for (const auto& point : points) {
-        double dx = point.x - ellipse.center.x;
-        double dy = point.y - ellipse.center.y;
-        
-        // 重み（距離の逆数で遠い点の影響を減らす）
-        double distance = std::sqrt(dx * dx + dy * dy);
-        double weight = 1.0 / (1.0 + distance);
-        
-        cxx += weight * dx * dx;
-        cyy += weight * dy * dy;
-        cxy += weight * dx * dy;
-        sum_weight += weight;
-    }
-    
-    // 正規化（ゼロ除算防止）
-    if (sum_weight < EPSILON) {
-        ellipse.semi_major_axis = MIN_AXIS_LENGTH;
-        ellipse.semi_minor_axis = MIN_AXIS_LENGTH;
-        ellipse.orientation = 0.0;
-        return ellipse;
-    }
-    
-    cxx /= sum_weight;
-    cyy /= sum_weight;
-    cxy /= sum_weight;
-    
-    // 固有値計算の数値安定性改善
-    double trace = cxx + cyy;
-    double det = cxx * cyy - cxy * cxy;
-    
-    // 判別式の計算（負値チェック）
-    double discriminant_squared = trace * trace - 4.0 * det;
-    if (discriminant_squared < 0.0) {
-        discriminant_squared = 0.0; // 数値誤差による負値を修正
-    }
-    double discriminant = std::sqrt(discriminant_squared);
-    
-    double eigenvalue1 = (trace + discriminant) / 2.0;
-    double eigenvalue2 = (trace - discriminant) / 2.0;
-    
-    // 固有値の安全性チェック
-    eigenvalue1 = std::max(eigenvalue1, EPSILON);
-    eigenvalue2 = std::max(eigenvalue2, EPSILON);
-    
-    // 楕円の軸長を計算（2σ = 95%信頼区間）
-    double axis1 = 2.0 * std::sqrt(eigenvalue1);
-    double axis2 = 2.0 * std::sqrt(eigenvalue2);
-    
-    ellipse.semi_major_axis = std::max(axis1, axis2);
-    ellipse.semi_minor_axis = std::min(axis1, axis2);
-    
-    // サイズ制限
-    ellipse.semi_major_axis = std::clamp(ellipse.semi_major_axis, MIN_AXIS_LENGTH, MAX_AXIS_LENGTH);
-    ellipse.semi_minor_axis = std::clamp(ellipse.semi_minor_axis, MIN_AXIS_LENGTH, MAX_AXIS_LENGTH);
-    
-    // 楕円の回転角を計算（数値安定性改善）
-    if (std::abs(cxy) < EPSILON) {
-        ellipse.orientation = (cxx > cyy) ? 0.0 : M_PI / 2.0;
-    } else {
-        ellipse.orientation = 0.5 * std::atan2(2.0 * cxy, cxx - cyy);
-        
-        // 角度を [-π/2, π/2] に正規化
-        while (ellipse.orientation > M_PI / 2.0) ellipse.orientation -= M_PI;
-        while (ellipse.orientation < -M_PI / 2.0) ellipse.orientation += M_PI;
-    }
-    
-    // 軸の長さ比チェック（極端な楕円を防ぐ）
-    double aspect_ratio = ellipse.semi_major_axis / ellipse.semi_minor_axis;
-    if (aspect_ratio > 5.0) {
-        ellipse.semi_minor_axis = ellipse.semi_major_axis / 5.0;
-    }
-    
-    return ellipse;
-}
 
-double ObstacleTrackerNode::transformOrientationToMap(double lidar_orientation, const rclcpp::Time& stamp)
-{
-    try {
-        // lidar_linkからmapフレームへの変換を取得
-        geometry_msgs::msg::TransformStamped transform = 
-            tf_buffer_->lookupTransform("map", "lidar_link", tf2::TimePointZero);
-        
-        // クォータニオンからZ軸回りの回転角（ヨー角）を抽出
-        // 簡単な変換式を使用: yaw = atan2(2(qw*qz + qx*qy), 1 - 2(qy² + qz²))
-        double qx = transform.transform.rotation.x;
-        double qy = transform.transform.rotation.y;
-        double qz = transform.transform.rotation.z;
-        double qw = transform.transform.rotation.w;
-        
-        double yaw = std::atan2(2.0 * (qw * qz + qx * qy), 
-                               1.0 - 2.0 * (qy * qy + qz * qz));
-        
-        // lidar_linkフレームでの楕円の向きにロボットの回転を加算
-        double map_orientation = lidar_orientation + yaw;
-        
-        // 角度を [-π, π] の範囲に正規化
-        while (map_orientation > M_PI) map_orientation -= 2.0 * M_PI;
-        while (map_orientation < -M_PI) map_orientation += 2.0 * M_PI;
-        
-        return map_orientation;
-        
-    } catch (const tf2::TransformException& ex) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "楕円の向き変換に失敗しました (lidar_link -> map): %s", ex.what());
-        
-        // 変換に失敗した場合は元の向きをそのまま返す
-        return lidar_orientation;
-    }
-}
 
 void ObstacleTrackerNode::addClearMarkers(visualization_msgs::msg::MarkerArray& marker_array, 
                                          const std::string& namespace_name, const rclcpp::Time& timestamp)

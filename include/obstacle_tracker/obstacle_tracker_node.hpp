@@ -63,10 +63,11 @@ private:
     void publishObstacles(const std::vector<Cluster>& clusters, const rclcpp::Time& timestamp);
     visualization_msgs::msg::MarkerArray createMarkerArray(
         const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp);
-    visualization_msgs::msg::MarkerArray createEllipseMarkers(
+    visualization_msgs::msg::MarkerArray createConnectedMarkerArray(
         const std::vector<Cluster>& clusters, bool is_dynamic, const rclcpp::Time& timestamp);
     void addClearMarkers(visualization_msgs::msg::MarkerArray& marker_array, 
                         const std::string& namespace_name, const rclcpp::Time& timestamp);
+    std::vector<Point3D> fillGapsInCluster(const Cluster& cluster);
     
     // ユーティリティ関数
     double calculateDistance(const Point3D& p1, const Point3D& p2);
@@ -74,7 +75,6 @@ private:
     bool isWithinProcessingRange(const Point3D& point);
     Point3D transformPointToMap(const Point3D& point, const std::string& source_frame, 
                                const rclcpp::Time& stamp);
-    double transformOrientationToMap(double lidar_orientation, const rclcpp::Time& stamp);
     Point3D getRobotVelocity();
     
     // パラメータ検証
@@ -91,21 +91,11 @@ private:
     std::vector<int> getNeighbors(int point_idx, const std::vector<Point3D>& points);
     bool isCore(int point_idx, const std::vector<Point3D>& points);
     
-    // 楕円計算関連
-    struct EllipseParams {
-        Point3D center;
-        double semi_major_axis;
-        double semi_minor_axis;
-        double orientation;  // 回転角度 [rad]
-    };
-    EllipseParams calculateClusterEllipse(const std::vector<Point3D>& points);
     
     // ROS2要素
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_obstacles_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr static_obstacles_publisher_;
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_ellipse_publisher_;
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr static_ellipse_publisher_;
     
     // パラメータ
     double robot_processing_range_;
@@ -123,9 +113,6 @@ private:
     double max_angular_difference_;   // 最大角度差 [rad]
     bool enable_adaptive_dbscan_;     // Adaptive DBSCAN有効/無効
     
-    // 楕円表示パラメータ
-    bool enable_ellipse_markers_;     // 楕円マーカー有効/無効
-    double ellipse_scale_factor_;     // 楕円スケール係数
     
     // 改善された追跡パラメータ
     bool enable_enhanced_tracking_;   // 改善された追跡の有効/無効
@@ -152,8 +139,6 @@ private:
     static constexpr int MIN_DBSCAN_POINTS = 1;
     static constexpr int MAX_DBSCAN_POINTS = 50;
     static constexpr double MAX_ADAPTIVE_FACTOR = 1.0;
-    static constexpr double MIN_ELLIPSE_SCALE = 0.1;
-    static constexpr double MAX_ELLIPSE_SCALE = 10.0;
     
     // TF関連
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

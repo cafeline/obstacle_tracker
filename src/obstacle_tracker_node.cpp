@@ -4,6 +4,8 @@
 #include <chrono>
 #include <unordered_map>
 #include <string>
+#include <set>
+#include <tuple>
 
 namespace obstacle_tracker
 {
@@ -691,14 +693,28 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createConnectedMarkerA
     visualization_msgs::msg::MarkerArray marker_array;
     int marker_id = 1; // 0はクリアマーカー用に予約
     
+    // 全クラスタにわたって重複チェック用のset
+    std::set<std::tuple<int, int, int>> global_unique_voxels;
+    
     for (const auto& cluster : clusters) {
         // クラスタ内の点を連結して隙間を埋める
         auto connected_points = fillGapsInCluster(cluster);
         
         // 連結された各点に対してマーカーを作成
         for (const auto& point : connected_points) {
-            // 各ボクセルの位置をmapフレームに変換
+            // mapフレームに変換してからボクセル位置を計算
             Point3D map_point = transformPointToMap(point, "lidar_link", timestamp);
+            
+            // ボクセル位置で重複チェック（mapフレーム座標で）
+            int vx = static_cast<int>(std::round(map_point.x / voxel_size_));
+            int vy = static_cast<int>(std::round(map_point.y / voxel_size_));
+            int vz = static_cast<int>(std::round(map_point.z / voxel_size_));
+            
+            auto voxel_key = std::make_tuple(vx, vy, vz);
+            if (global_unique_voxels.find(voxel_key) != global_unique_voxels.end()) {
+                continue; // 既に存在するボクセル位置はスキップ
+            }
+            global_unique_voxels.insert(voxel_key);
             
             visualization_msgs::msg::Marker marker;
             marker.header.frame_id = "map";
@@ -708,10 +724,10 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createConnectedMarkerA
             marker.type = visualization_msgs::msg::Marker::CUBE;
             marker.action = visualization_msgs::msg::Marker::ADD;
             
-            // 位置設定
-            marker.pose.position.x = map_point.x;
-            marker.pose.position.y = map_point.y;
-            marker.pose.position.z = map_point.z;
+            // 位置設定（ボクセルグリッドの中心に配置）
+            marker.pose.position.x = vx * voxel_size_;
+            marker.pose.position.y = vy * voxel_size_;
+            marker.pose.position.z = vz * voxel_size_;
             marker.pose.orientation.w = 1.0;
             
             // サイズ設定
@@ -737,20 +753,37 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createConnectedMarkerA
         }
     }
     
+    RCLCPP_DEBUG(this->get_logger(), "Created %zu unique voxel markers for %zu clusters (%s)", 
+                marker_array.markers.size(), clusters.size(), 
+                is_dynamic ? "dynamic" : "static");
+    
     return marker_array;
 }
 
 std::vector<Point3D> ObstacleTrackerNode::fillGapsInCluster(const Cluster& cluster)
 {
-    std::vector<Point3D> filled_points = cluster.points;
-    
     if (cluster.points.size() < 2) {
-        return filled_points; // 点が少なすぎる場合はそのまま返す
+        return cluster.points; // 点が少なすぎる場合はそのまま返す
     }
     
-    // クラスタ内の各点間の距離をチェックし、隙間を埋める
-    std::vector<Point3D> additional_points;
+    // 重複排除のためにsetを使用（ボクセルグリッド位置での管理）
+    std::set<std::tuple<int, int, int>> unique_voxels;
+    std::vector<Point3D> filled_points;
     
+    // 元の点をvoxel位置でハッシュ化して追加
+    for (const auto& point : cluster.points) {
+        int vx = static_cast<int>(std::round(point.x / voxel_size_));
+        int vy = static_cast<int>(std::round(point.y / voxel_size_));
+        int vz = static_cast<int>(std::round(point.z / voxel_size_));
+        
+        auto voxel_key = std::make_tuple(vx, vy, vz);
+        if (unique_voxels.find(voxel_key) == unique_voxels.end()) {
+            unique_voxels.insert(voxel_key);
+            filled_points.push_back(point);
+        }
+    }
+    
+    // クラスタ内の各点間の隙間を埋める
     for (size_t i = 0; i < cluster.points.size(); ++i) {
         for (size_t j = i + 1; j < cluster.points.size(); ++j) {
             const Point3D& p1 = cluster.points[i];
@@ -777,17 +810,23 @@ std::vector<Point3D> ObstacleTrackerNode::fillGapsInCluster(const Cluster& clust
                     interpolated_point.y = p1.y + t * (p2.y - p1.y);
                     interpolated_point.z = p1.z + t * (p2.z - p1.z);
                     
-                    additional_points.push_back(interpolated_point);
+                    // ボクセル位置で重複チェック
+                    int vx = static_cast<int>(std::round(interpolated_point.x / voxel_size_));
+                    int vy = static_cast<int>(std::round(interpolated_point.y / voxel_size_));
+                    int vz = static_cast<int>(std::round(interpolated_point.z / voxel_size_));
+                    
+                    auto voxel_key = std::make_tuple(vx, vy, vz);
+                    if (unique_voxels.find(voxel_key) == unique_voxels.end()) {
+                        unique_voxels.insert(voxel_key);
+                        filled_points.push_back(interpolated_point);
+                    }
                 }
             }
         }
     }
     
-    // 元の点と補間点を結合
-    filled_points.insert(filled_points.end(), additional_points.begin(), additional_points.end());
-    
-    RCLCPP_DEBUG(this->get_logger(), "Cluster gap filling: original=%zu, filled=%zu (+%zu)", 
-                cluster.points.size(), filled_points.size(), additional_points.size());
+    RCLCPP_DEBUG(this->get_logger(), "Cluster gap filling: original=%zu, filled=%zu (unique voxels: %zu)", 
+                cluster.points.size(), filled_points.size(), unique_voxels.size());
     
     return filled_points;
 }

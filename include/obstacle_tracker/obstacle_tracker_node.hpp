@@ -13,6 +13,7 @@
 #include <vector>
 #include <memory>
 #include <map>
+#include <deque>
 
 namespace obstacle_tracker
 {
@@ -91,6 +92,11 @@ private:
     std::vector<int> getNeighbors(int point_idx, const std::vector<Point3D>& points);
     bool isCore(int point_idx, const std::vector<Point3D>& points);
     
+    // スライディングウィンドウ関連メソッド
+    void updateSlidingWindow(const std::vector<Point3D>& points, const rclcpp::Time& timestamp);
+    std::vector<Point3D> getAggregatedPoints() const;
+    void cleanupOldObservations(const rclcpp::Time& current_time);
+    
     
     // ROS2要素
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber_;
@@ -120,6 +126,11 @@ private:
     double confidence_decay_rate_;    // 信頼度減衰率
     int max_missing_frames_;          // 最大欠測フレーム数
     
+    // スライディングウィンドウパラメータ
+    bool enable_sliding_window_;      // スライディングウィンドウの有効/無効
+    int sliding_window_size_;         // 保持するフレーム数
+    int min_voxel_observations_;      // ボクセルが有効と判定される最小観測回数
+    
     // パラメータ検証用定数
     static constexpr double MIN_PROCESSING_RANGE = 0.1;
     static constexpr double MAX_PROCESSING_RANGE = 50.0;
@@ -148,6 +159,17 @@ private:
     std::map<int, Cluster> previous_clusters_;
     int next_cluster_id_;
     rclcpp::Time last_scan_time_;
+    
+    // スライディングウィンドウ用データ構造
+    struct VoxelObservation {
+        Point3D position;
+        rclcpp::Time timestamp;
+        double angle;  // LiDAR角度情報
+    };
+    
+    std::deque<std::vector<Point3D>> point_history_;  // 過去数フレームの生点群
+    std::deque<rclcpp::Time> frame_timestamps_;       // 各フレームのタイムスタンプ
+    std::map<std::tuple<int, int, int>, std::vector<VoxelObservation>> voxel_history_;  // ボクセルごとの観測履歴
     
     // ロボット速度追跡
     Point3D previous_robot_position_;

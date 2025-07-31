@@ -43,6 +43,11 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     this->declare_parameter("confidence_decay_rate", 0.1);
     this->declare_parameter("max_missing_frames", 5);
     
+    // スライディングウィンドウパラメータ
+    this->declare_parameter("enable_sliding_window", true);
+    this->declare_parameter("sliding_window_size", 3);  // 保持するフレーム数
+    this->declare_parameter("min_voxel_observations", 2);  // ボクセルが有効と判定される最小観測回数
+    
     // パラメータの取得
     robot_processing_range_ = this->get_parameter("robot_processing_range").as_double();
     dynamic_cluster_speed_threshold_ = this->get_parameter("dynamic_cluster_speed_threshold").as_double();
@@ -65,6 +70,11 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     velocity_smoothing_alpha_ = this->get_parameter("velocity_smoothing_alpha").as_double();
     confidence_decay_rate_ = this->get_parameter("confidence_decay_rate").as_double();
     max_missing_frames_ = this->get_parameter("max_missing_frames").as_int();
+    
+    // スライディングウィンドウパラメータ取得
+    enable_sliding_window_ = this->get_parameter("enable_sliding_window").as_bool();
+    sliding_window_size_ = this->get_parameter("sliding_window_size").as_int();
+    min_voxel_observations_ = this->get_parameter("min_voxel_observations").as_int();
     
     // パラメータ検証
     validateParameters();
@@ -90,6 +100,9 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
         RCLCPP_INFO(this->get_logger(), "DBSCAN params - base_eps: %.2f, min_points: %d, adaptive_factor: %.3f", 
                    dbscan_base_eps_, dbscan_min_points_, distance_adaptive_factor_);
     }
+    RCLCPP_INFO(this->get_logger(), "Sliding window: %s (size: %d frames, min_obs: %d)", 
+               enable_sliding_window_ ? "enabled" : "disabled", 
+               sliding_window_size_, min_voxel_observations_);
 }
 
 void ObstacleTrackerNode::validateParameters()
@@ -169,6 +182,18 @@ void ObstacleTrackerNode::validateParameters()
         params_valid = false;
     }
     
+    // スライディングウィンドウパラメータの検証
+    if (sliding_window_size_ < 1 || sliding_window_size_ > 20) {
+        error_messages.push_back("Invalid sliding_window_size: " + std::to_string(sliding_window_size_) +
+                               " (must be 1 <= value <= 20)");
+        params_valid = false;
+    }
+    
+    if (min_voxel_observations_ < 1 || min_voxel_observations_ > sliding_window_size_) {
+        error_messages.push_back("Invalid min_voxel_observations: " + std::to_string(min_voxel_observations_) +
+                               " (must be 1 <= value <= sliding_window_size)");
+        params_valid = false;
+    }
     
     // パラメータ整合性チェック（警告）
     if (clustering_max_distance_ < voxel_size_) {
@@ -249,18 +274,31 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
         // 2. ボクセル化
         std::vector<Point3D> voxelized_points = voxelizePoints(points);
         
-        // 3. クラスタリング（時刻を統一して渡す）
-        std::vector<Cluster> clusters = enable_adaptive_dbscan_ ? 
-            adaptiveDBSCANCluster(voxelized_points, current_time) : clusterPoints(voxelized_points, current_time);
+        // 3. スライディングウィンドウ処理と点群集約
+        std::vector<Point3D> aggregated_points;
         
-        // 4. クラスタ追跡
+        if (enable_sliding_window_) {
+            // 3-1. スライディングウィンドウに点群を追加
+            updateSlidingWindow(voxelized_points, current_time);
+            
+            // 3-2. 集約された点群を取得
+            aggregated_points = getAggregatedPoints();
+        } else {
+            aggregated_points = voxelized_points;
+        }
+        
+        // 4. クラスタリング（集約された点群で実行）
+        std::vector<Cluster> clusters = enable_adaptive_dbscan_ ? 
+            adaptiveDBSCANCluster(aggregated_points, current_time) : clusterPoints(aggregated_points, current_time);
+        
+        // 5. クラスタ追跡
         if (enable_enhanced_tracking_) {
             enhancedTrackClusters(clusters);
         } else {
             trackClusters(clusters);
         }
         
-        // 5. 動的・静的分類
+        // 6. 動的・静的分類
         classifyClusters(clusters);
         
         // 6. 結果を配信（時刻を統一して渡す）
@@ -829,6 +867,96 @@ std::vector<Point3D> ObstacleTrackerNode::fillGapsInCluster(const Cluster& clust
                 cluster.points.size(), filled_points.size(), unique_voxels.size());
     
     return filled_points;
+}
+
+void ObstacleTrackerNode::updateSlidingWindow(const std::vector<Point3D>& points, const rclcpp::Time& timestamp)
+{
+    // 新しいフレームを履歴に追加
+    point_history_.push_back(points);
+    frame_timestamps_.push_back(timestamp);
+    
+    // 古いフレームを削除（指定したウィンドウサイズを維持）
+    while (static_cast<int>(point_history_.size()) > sliding_window_size_) {
+        point_history_.pop_front();
+        frame_timestamps_.pop_front();
+    }
+    
+    // ボクセル履歴を更新
+    for (const auto& point : points) {
+        // ボクセル位置を計算
+        int vx = static_cast<int>(std::round(point.x / voxel_size_));
+        int vy = static_cast<int>(std::round(point.y / voxel_size_));
+        int vz = static_cast<int>(std::round(point.z / voxel_size_));
+        
+        auto voxel_key = std::make_tuple(vx, vy, vz);
+        
+        // 観測記録を追加
+        VoxelObservation obs;
+        obs.position = point;
+        obs.timestamp = timestamp;
+        obs.angle = point.angle;
+        
+        voxel_history_[voxel_key].push_back(obs);
+    }
+    
+    // 古い観測記録をクリーンアップ
+    cleanupOldObservations(timestamp);
+    
+    RCLCPP_DEBUG(this->get_logger(), "Sliding window updated: %zu frames, %zu unique voxels", 
+                point_history_.size(), voxel_history_.size());
+}
+
+std::vector<Point3D> ObstacleTrackerNode::getAggregatedPoints() const
+{
+    std::vector<Point3D> aggregated_points;
+    
+    // 各ボクセルの観測回数をチェックして、閾値以上のもののみを含める
+    for (const auto& [voxel_key, observations] : voxel_history_) {
+        if (static_cast<int>(observations.size()) >= min_voxel_observations_) {
+            // 最新の観測を代表点として使用
+            if (!observations.empty()) {
+                auto latest_obs = std::max_element(observations.begin(), observations.end(),
+                    [](const VoxelObservation& a, const VoxelObservation& b) {
+                        return a.timestamp < b.timestamp;
+                    });
+                aggregated_points.push_back(latest_obs->position);
+            }
+        }
+    }
+    
+    RCLCPP_DEBUG(this->get_logger(), "Aggregated points: %zu (from %zu voxels, min_obs=%d)", 
+                aggregated_points.size(), voxel_history_.size(), min_voxel_observations_);
+    
+    return aggregated_points;
+}
+
+void ObstacleTrackerNode::cleanupOldObservations(const rclcpp::Time& current_time)
+{
+    // 最も古いフレームのタイムスタンプを基準とする
+    if (frame_timestamps_.empty()) return;
+    
+    rclcpp::Time oldest_valid_time = frame_timestamps_.front();
+    
+    // 各ボクセルの観測履歴から古い観測を削除
+    for (auto it = voxel_history_.begin(); it != voxel_history_.end();) {
+        auto& observations = it->second;
+        
+        // 古い観測を削除
+        observations.erase(
+            std::remove_if(observations.begin(), observations.end(),
+                [&oldest_valid_time](const VoxelObservation& obs) {
+                    return obs.timestamp < oldest_valid_time;
+                }),
+            observations.end()
+        );
+        
+        // 観測がなくなったボクセルを削除
+        if (observations.empty()) {
+            it = voxel_history_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createMarkerArray(

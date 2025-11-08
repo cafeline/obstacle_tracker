@@ -81,7 +81,8 @@ ObstacleTrackerNode::ObstacleTrackerNode() : Node("obstacle_tracker_node"), next
     
     // サブスクライバーとパブリッシャーの作成
     scan_subscriber_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-        "/scan", 10, std::bind(&ObstacleTrackerNode::laserScanCallback, this, std::placeholders::_1));
+        "/scan", rclcpp::SensorDataQoS(),
+        std::bind(&ObstacleTrackerNode::laserScanCallback, this, std::placeholders::_1));
     
     dynamic_obstacles_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/dynamic_obstacles", 10);

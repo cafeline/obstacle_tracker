@@ -14,8 +14,9 @@ find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
 
-add_executable(obstacle_tracker 
+add_executable(obstacle_tracker
   src/obstacle_tracker.cpp
   src/obstacle_tracker_node.cpp
 )
@@ -33,14 +34,15 @@ ament_target_dependencies(obstacle_tracker
   tf2_ros
   tf2_geometry_msgs
 )
+target_link_libraries(obstacle_tracker Eigen3::Eigen)
 
 install(TARGETS obstacle_tracker
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  find_package(ament_cmake_gtest REQUIRED)
-  
+find_package(ament_cmake_gtest REQUIRED)
+
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
@@ -49,9 +51,9 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
-  
+
   # Add gtest
-  ament_add_gtest(${PROJECT_NAME}_test 
+  ament_add_gtest(${PROJECT_NAME}_test
     test/test_obstacle_tracker.cpp
     src/obstacle_tracker_node.cpp
   )
@@ -68,6 +70,7 @@ if(BUILD_TESTING)
       tf2_ros
       tf2_geometry_msgs
     )
+    target_link_libraries(${PROJECT_NAME}_test Eigen3::Eigen)
   endif()
 endif()
 

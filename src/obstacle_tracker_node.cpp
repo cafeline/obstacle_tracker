@@ -3,6 +3,8 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <functional>
+#include <array>
+#include <Eigen/Eigenvalues>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -561,15 +563,10 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::buildMarkerArray(
     marker.header.stamp = stamp;
     marker.ns = dynamic ? "dynamic_obstacles" : "static_obstacles";
     marker.id = marker_id++;
-    marker.type = visualization_msgs::msg::Marker::CUBE;
+    marker.type = visualization_msgs::msg::Marker::LINE_LIST;
     marker.action = visualization_msgs::msg::Marker::ADD;
-    marker.pose.position.x = centroid_map.x;
-    marker.pose.position.y = centroid_map.y;
-    marker.pose.position.z = centroid_map.z;
     marker.pose.orientation.w = 1.0;
-    marker.scale.x = std::max(voxel_size_, cluster.shape.length);
-    marker.scale.y = std::max(voxel_size_, cluster.shape.width);
-    marker.scale.z = voxel_size_;
+    marker.scale.x = 0.05;
     if (dynamic) {
       marker.color.r = 1.0;
       marker.color.g = 0.2;
@@ -579,8 +576,89 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::buildMarkerArray(
       marker.color.g = 0.2;
       marker.color.b = 1.0;
     }
-    marker.color.a = 0.2;
+    marker.color.a = 1.0;
     marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+
+    if (cluster.points.empty()) {
+      continue;
+    }
+
+    Eigen::Vector2d axis_long(1.0, 0.0);
+    Eigen::Vector2d axis_short(0.0, 1.0);
+    if (cluster.points.size() >= 2) {
+      Eigen::Matrix2d cov = Eigen::Matrix2d::Zero();
+      for (const auto & pt : cluster.points) {
+        double dx = pt.x - centroid_map.x;
+        double dy = pt.y - centroid_map.y;
+        cov(0, 0) += dx * dx;
+        cov(0, 1) += dx * dy;
+        cov(1, 0) += dx * dy;
+        cov(1, 1) += dy * dy;
+      }
+      cov /= static_cast<double>(cluster.points.size());
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> solver(cov);
+      if (solver.info() == Eigen::Success) {
+        axis_long = solver.eigenvectors().col(1).normalized();
+        axis_short = Eigen::Vector2d(-axis_long.y(), axis_long.x());
+      }
+    }
+
+    double min_long = std::numeric_limits<double>::max();
+    double max_long = -std::numeric_limits<double>::max();
+    double min_short = std::numeric_limits<double>::max();
+    double max_short = -std::numeric_limits<double>::max();
+    for (const auto & pt : cluster.points) {
+      Eigen::Vector2d diff(pt.x - centroid_map.x, pt.y - centroid_map.y);
+      double proj_long = diff.dot(axis_long);
+      double proj_short = diff.dot(axis_short);
+      min_long = std::min(min_long, proj_long);
+      max_long = std::max(max_long, proj_long);
+      min_short = std::min(min_short, proj_short);
+      max_short = std::max(max_short, proj_short);
+    }
+
+    if (!std::isfinite(min_long) || !std::isfinite(max_long) ||
+      !std::isfinite(min_short) || !std::isfinite(max_short))
+    {
+      continue;
+    }
+
+    double length = max_long - min_long;
+    if (length < 2.0 * voxel_size_) {
+      double delta = (2.0 * voxel_size_ - length) * 0.5;
+      min_long -= delta;
+      max_long += delta;
+    }
+
+    double width = max_short - min_short;
+    if (width < 2.0 * voxel_size_) {
+      double delta = (2.0 * voxel_size_ - width) * 0.5;
+      min_short -= delta;
+      max_short += delta;
+    }
+
+    std::array<geometry_msgs::msg::Point, 4> corners{};
+    std::array<Eigen::Vector2d, 4> projections = {
+      Eigen::Vector2d(min_long, min_short),
+      Eigen::Vector2d(max_long, min_short),
+      Eigen::Vector2d(max_long, max_short),
+      Eigen::Vector2d(min_long, max_short)};
+
+    for (size_t i = 0; i < 4; ++i) {
+      Eigen::Vector2d world =
+        Eigen::Vector2d(centroid_map.x, centroid_map.y) +
+        axis_long * projections[i].x() +
+        axis_short * projections[i].y();
+      corners[i].x = world.x();
+      corners[i].y = world.y();
+      corners[i].z = centroid_map.z;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+      marker.points.push_back(corners[i]);
+      marker.points.push_back(corners[(i + 1) % 4]);
+    }
+
     array.markers.push_back(marker);
   }
   return array;

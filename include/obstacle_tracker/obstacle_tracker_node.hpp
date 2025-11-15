@@ -96,6 +96,10 @@ private:
     void updateSlidingWindow(const std::vector<Point3D>& points, const rclcpp::Time& timestamp);
     std::vector<Point3D> getAggregatedPoints() const;
     void cleanupOldObservations(const rclcpp::Time& current_time);
+    void trimMarkerHistory(std::deque<std::vector<visualization_msgs::msg::Marker>>& history);
+    void appendHistoryMarkers(
+        const std::deque<std::vector<visualization_msgs::msg::Marker>>& history,
+        visualization_msgs::msg::MarkerArray& marker_array);
     
     
     // ROS2要素
@@ -177,7 +181,9 @@ private:
     Point3D current_robot_velocity_;
     bool robot_velocity_initialized_;
     
-    // 処理頻度制限（秒単位で管理、static変数に移行）
+    // マーカー履歴（最新sliding_window_sizeフレーム分を保持）
+    std::deque<std::vector<visualization_msgs::msg::Marker>> dynamic_marker_history_;
+    std::deque<std::vector<visualization_msgs::msg::Marker>> static_marker_history_;
 };
 
 } // namespace obstacle_tracker

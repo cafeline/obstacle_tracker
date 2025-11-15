@@ -714,16 +714,25 @@ void ObstacleTrackerNode::publishObstacles(const std::vector<Cluster>& clusters,
     auto dynamic_markers = createConnectedMarkerArray(dynamic_clusters, true, timestamp);
     auto static_markers = createConnectedMarkerArray(static_clusters, false, timestamp);
     
-    // 古いマーカーをクリアするためのマーカーを追加
-    addClearMarkers(dynamic_markers, "dynamic_obstacles", timestamp);
-    addClearMarkers(static_markers, "static_obstacles", timestamp);
+    // フレーム履歴を更新（sliding_window_size_ 件に制限）
+    dynamic_marker_history_.push_back(dynamic_markers.markers);
+    static_marker_history_.push_back(static_markers.markers);
+    trimMarkerHistory(dynamic_marker_history_);
+    trimMarkerHistory(static_marker_history_);
     
-    dynamic_obstacles_publisher_->publish(dynamic_markers);
-    static_obstacles_publisher_->publish(static_markers);
+    // 履歴全体をまとめてpublish（DELETEALLの後に履歴分を復元）
+    visualization_msgs::msg::MarkerArray dynamic_output;
+    addClearMarkers(dynamic_output, "dynamic_obstacles", timestamp);
+    appendHistoryMarkers(dynamic_marker_history_, dynamic_output);
+    dynamic_obstacles_publisher_->publish(dynamic_output);
     
+    visualization_msgs::msg::MarkerArray static_output;
+    addClearMarkers(static_output, "static_obstacles", timestamp);
+    appendHistoryMarkers(static_marker_history_, static_output);
+    static_obstacles_publisher_->publish(static_output);
     
-    RCLCPP_DEBUG(this->get_logger(), "Published %zu dynamic and %zu static clusters",
-                dynamic_clusters.size(), static_clusters.size());
+    RCLCPP_DEBUG(this->get_logger(), "Published marker history: dynamic_frames=%zu, static_frames=%zu",
+                dynamic_marker_history_.size(), static_marker_history_.size());
 }
 
 visualization_msgs::msg::MarkerArray ObstacleTrackerNode::createConnectedMarkerArray(
@@ -965,6 +974,28 @@ void ObstacleTrackerNode::cleanupOldObservations(const rclcpp::Time& current_tim
             it = voxel_history_.erase(it);
         } else {
             ++it;
+        }
+    }
+}
+
+void ObstacleTrackerNode::trimMarkerHistory(
+    std::deque<std::vector<visualization_msgs::msg::Marker>>& history)
+{
+    while (history.size() > static_cast<size_t>(sliding_window_size_)) {
+        history.pop_front();
+    }
+}
+
+void ObstacleTrackerNode::appendHistoryMarkers(
+    const std::deque<std::vector<visualization_msgs::msg::Marker>>& history,
+    visualization_msgs::msg::MarkerArray& marker_array)
+{
+    int next_id = 1;
+    for (const auto& frame_markers : history) {
+        for (const auto& marker : frame_markers) {
+            visualization_msgs::msg::Marker adjusted_marker = marker;
+            adjusted_marker.id = next_id++;
+            marker_array.markers.push_back(adjusted_marker);
         }
     }
 }

@@ -120,6 +120,10 @@ private:
     const std::vector<Cluster> & clusters,
     bool dynamic,
     const rclcpp::Time & stamp);
+  visualization_msgs::msg::MarkerArray buildCubeListMarkerArray(
+    const std::vector<Cluster> & clusters,
+    bool dynamic,
+    const rclcpp::Time & stamp);
   Point3D transformPointToMap(const Point3D & point) const;
 
   // Parameters
@@ -141,6 +145,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr static_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_dynamic_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_static_publisher_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 

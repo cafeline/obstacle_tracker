@@ -248,6 +248,10 @@ ObstacleTrackerNode::ObstacleTrackerNode()
     "/dynamic_obstacles", 10);
   static_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     "/static_obstacles", 10);
+  debug_dynamic_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+    "/dynamic_obstacles_debug", 10);
+  debug_static_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+    "/static_obstacles_debug", 10);
 
   RCLCPP_INFO(
     this->get_logger(), "Obstacle tracker initialized: range=%.2f, voxel=%.2f, min_pts=%d",
@@ -664,6 +668,51 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::buildMarkerArray(
   return array;
 }
 
+visualization_msgs::msg::MarkerArray ObstacleTrackerNode::buildCubeListMarkerArray(
+  const std::vector<Cluster> & clusters,
+  bool dynamic,
+  const rclcpp::Time & stamp)
+{
+  visualization_msgs::msg::MarkerArray array;
+  int marker_id = 1;
+
+  for (const auto & cluster : clusters) {
+    Point3D centroid_map = transformPointToMap(cluster.centroid);
+    if (centroid_map.frame_id != "map") {
+      continue;
+    }
+
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = "map";
+    marker.header.stamp = stamp;
+    marker.ns = dynamic ? "dynamic_obstacles" : "static_obstacles";
+    marker.id = marker_id++;
+    marker.type = visualization_msgs::msg::Marker::CUBE;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.position.x = centroid_map.x;
+    marker.pose.position.y = centroid_map.y;
+    marker.pose.position.z = centroid_map.z;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = std::max(voxel_size_, cluster.shape.length);
+    marker.scale.y = std::max(voxel_size_, cluster.shape.width);
+    marker.scale.z = voxel_size_;
+    if (dynamic) {
+      marker.color.r = 1.0;
+      marker.color.g = 0.2;
+      marker.color.b = 0.2;
+    } else {
+      marker.color.r = 0.2;
+      marker.color.g = 0.2;
+      marker.color.b = 1.0;
+    }
+    marker.color.a = 1.0;
+    marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+    array.markers.push_back(marker);
+  }
+
+  return array;
+}
+
 Point3D ObstacleTrackerNode::transformPointToMap(const Point3D & point) const
 {
   if (point.frame_id == "map") {
@@ -745,8 +794,8 @@ void ObstacleTrackerNode::publishClusters(
     }
   }
 
-  auto dynamic_markers = buildMarkerArray(dynamic_clusters, true, stamp);
-  auto static_markers = buildMarkerArray(static_clusters, false, stamp);
+  auto dynamic_markers = buildCubeListMarkerArray(dynamic_clusters, true, stamp);
+  auto static_markers = buildCubeListMarkerArray(static_clusters, false, stamp);
 
   dynamic_history_.push_back(dynamic_markers);
   static_history_.push_back(static_markers);
@@ -781,6 +830,11 @@ void ObstacleTrackerNode::publishClusters(
 
   dynamic_publisher_->publish(buildOutput(dynamic_history_, "dynamic_obstacles"));
   static_publisher_->publish(buildOutput(static_history_, "static_obstacles"));
+
+  auto debug_dynamic = buildMarkerArray(dynamic_clusters, true, stamp);
+  auto debug_static = buildMarkerArray(static_clusters, false, stamp);
+  debug_dynamic_publisher_->publish(debug_dynamic);
+  debug_static_publisher_->publish(debug_static);
 }
 
 double ObstacleTrackerNode::computeDeltaTime(const rclcpp::Time & stamp)

@@ -55,20 +55,14 @@ private:
 
   // ROS
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_pub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr static_pub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_dynamic_pub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_static_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr obstacles_pub_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   mutable std::optional<geometry_msgs::msg::TransformStamped> last_tf_;
 
   // Parameters
   std::string scan_topic_;
-  std::string dynamic_topic_;
-  std::string static_topic_;
-  std::string debug_dynamic_topic_;
-  std::string debug_static_topic_;
+  std::string obstacles_topic_;
   std::string target_frame_;
   double tf_timeout_sec_{};
   double processing_range_{};

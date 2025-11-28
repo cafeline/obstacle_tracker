@@ -12,14 +12,7 @@ ObstacleTrackerNode::ObstacleTrackerNode()
 {
   // Parameters (mimic pointcloud2_cutter style: declare and log)
   scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
-  dynamic_topic_ = declare_parameter<std::string>("dynamic_topic", "/dynamic_obstacles");
-  static_topic_ = declare_parameter<std::string>("static_topic", "/static_obstacles");
-  debug_dynamic_topic_ = declare_parameter<std::string>(
-    "debug_dynamic_topic",
-    "/dynamic_obstacles_debug");
-  debug_static_topic_ = declare_parameter<std::string>(
-    "debug_static_topic",
-    "/static_obstacles_debug");
+  obstacles_topic_ = declare_parameter<std::string>("obstacles_topic", "/obstacles");
   target_frame_ = declare_parameter<std::string>("target_frame", "map");
   tf_timeout_sec_ = declare_parameter<double>("tf_timeout_sec", 0.05);
   processing_range_ = declare_parameter<double>("processing_range", 10.0);
@@ -36,19 +29,13 @@ ObstacleTrackerNode::ObstacleTrackerNode()
     std::bind(&ObstacleTrackerNode::laserScanCallback, this, std::placeholders::_1));
 
   auto marker_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-  dynamic_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-    dynamic_topic_, marker_qos);
-  static_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-    static_topic_, marker_qos);
-  debug_dynamic_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-    debug_dynamic_topic_, marker_qos);
-  debug_static_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-    debug_static_topic_, marker_qos);
+  obstacles_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+    obstacles_topic_, marker_qos);
 
   RCLCPP_INFO(
     this->get_logger(),
-    "obstacle_tracker 起動: scan=%s, dynamic=%s, static=%s, target_frame=%s",
-    scan_topic_.c_str(), dynamic_topic_.c_str(), static_topic_.c_str(), target_frame_.c_str());
+    "obstacle_tracker 起動: scan=%s, obstacles=%s, target_frame=%s",
+    scan_topic_.c_str(), obstacles_topic_.c_str(), target_frame_.c_str());
 }
 
 void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -67,10 +54,12 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
   auto cubes = buildCubes(clusters, true, stamp, marker_frame);
   auto outlines = buildOutlines(clusters, true, stamp, marker_frame);
 
-  dynamic_pub_->publish(cubes);
-  static_pub_->publish(cubes);
-  debug_dynamic_pub_->publish(outlines);
-  debug_static_pub_->publish(outlines);
+  visualization_msgs::msg::MarkerArray merged;
+  merged.markers.reserve(cubes.markers.size() + outlines.markers.size());
+  merged.markers.insert(merged.markers.end(), cubes.markers.begin(), cubes.markers.end());
+  merged.markers.insert(merged.markers.end(), outlines.markers.begin(), outlines.markers.end());
+
+  obstacles_pub_->publish(merged);
 }
 
 std::vector<Point2D> ObstacleTrackerNode::scanToPoints(const sensor_msgs::msg::LaserScan & scan)

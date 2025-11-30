@@ -13,6 +13,7 @@ ObstacleTrackerNode::ObstacleTrackerNode()
   // Parameters (mimic pointcloud2_cutter style: declare and log)
   scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
   obstacles_topic_ = declare_parameter<std::string>("obstacles_topic", "/obstacles");
+  mask_topic_ = declare_parameter<std::string>("mask_topic", "/obstacle_mask");
   target_frame_ = declare_parameter<std::string>("target_frame", "map");
   tf_timeout_sec_ = declare_parameter<double>("tf_timeout_sec", 0.05);
   processing_range_ = declare_parameter<double>("processing_range", 10.0);
@@ -20,6 +21,8 @@ ObstacleTrackerNode::ObstacleTrackerNode()
   range_jump_min_ = declare_parameter<double>("range_jump_min", 0.05);
   min_cluster_points_ = declare_parameter<int>("min_cluster_points", 3);
   range_gap_abs_ = declare_parameter<double>("range_gap_abs", 0.5);
+  declare_parameter<double>("mask_resolution", 0.05);
+  declare_parameter<double>("mask_inflation_radius", 0.1);
 
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -31,11 +34,13 @@ ObstacleTrackerNode::ObstacleTrackerNode()
   auto marker_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
   obstacles_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     obstacles_topic_, marker_qos);
+  auto mask_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+  mask_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(mask_topic_, mask_qos);
 
   RCLCPP_INFO(
     this->get_logger(),
-    "obstacle_tracker 起動: scan=%s, obstacles=%s, target_frame=%s",
-    scan_topic_.c_str(), obstacles_topic_.c_str(), target_frame_.c_str());
+    "obstacle_tracker 起動: scan=%s, obstacles=%s, mask=%s, target_frame=%s",
+    scan_topic_.c_str(), obstacles_topic_.c_str(), mask_topic_.c_str(), target_frame_.c_str());
 }
 
 void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -51,6 +56,15 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
   auto clusters = segmentByRangeJump(points_map);
 
   rclcpp::Time stamp(msg->header.stamp);
+  std::optional<Point2D> sensor_origin;
+  if (last_tf_) {
+    sensor_origin = Point2D{
+      last_tf_->transform.translation.x,
+      last_tf_->transform.translation.y};
+  }
+  auto mask = buildOccupancyMask(points_map, clusters, stamp, marker_frame, sensor_origin);
+  mask_pub_->publish(mask);
+
   auto cubes = buildCubes(clusters, true, stamp, marker_frame);
   auto outlines = buildOutlines(clusters, true, stamp, marker_frame);
 
@@ -283,6 +297,164 @@ visualization_msgs::msg::MarkerArray ObstacleTrackerNode::buildOutlines(
     arr.markers.push_back(m);
   }
   return arr;
+}
+
+nav_msgs::msg::OccupancyGrid ObstacleTrackerNode::buildOccupancyMask(
+  const std::vector<Point2D> & points,
+  const std::vector<Cluster> & clusters,
+  const rclcpp::Time & stamp,
+  const std::string & frame_id,
+  const std::optional<Point2D> & sensor_origin) const
+{
+  (void)points;  // 未使用だがインターフェース維持のため
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = frame_id;
+  grid.header.stamp = stamp;
+
+  const double resolution_param = this->get_parameter("mask_resolution").as_double();
+  const double range_param = this->get_parameter("processing_range").as_double();
+  const double inflation_param = this->get_parameter("mask_inflation_radius").as_double();
+  const double resolution = std::max(0.01, resolution_param);
+  const double range = std::max(resolution, range_param);
+  const double inflation = std::max(0.0, inflation_param);
+  const uint32_t width = static_cast<uint32_t>(std::ceil((range * 2.0) / resolution)) + 1;
+  grid.info.resolution = resolution;
+  grid.info.width = width;
+  grid.info.height = width;
+
+  const Point2D origin_pt = sensor_origin.value_or(Point2D{0.0, 0.0});
+  const double origin_x = origin_pt.x - range;
+  const double origin_y = origin_pt.y - range;
+
+  grid.info.origin.position.x = origin_x;
+  grid.info.origin.position.y = origin_y;
+  grid.info.origin.position.z = 0.0;
+  grid.info.origin.orientation.w = 1.0;
+
+  grid.data.assign(static_cast<size_t>(grid.info.width) * grid.info.height, -1);
+
+  auto toIndex = [&](double x, double y) -> std::optional<size_t> {
+      int col = static_cast<int>(std::floor((x - origin_x) / resolution));
+      int row = static_cast<int>(std::floor((y - origin_y) / resolution));
+      if (col < 0 || row < 0 ||
+        col >= static_cast<int>(grid.info.width) || row >= static_cast<int>(grid.info.height))
+      {
+        return std::nullopt;
+      }
+      return static_cast<size_t>(row) * grid.info.width + static_cast<size_t>(col);
+    };
+
+  auto pointInside = [](const std::vector<Point2D> & poly, const Point2D & pt) {
+      bool inside = false;
+      const size_t n = poly.size();
+      for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const bool intersect = ((poly[i].y > pt.y) != (poly[j].y > pt.y)) &&
+          (pt.x < (poly[j].x - poly[i].x) * (pt.y - poly[i].y) /
+          (poly[j].y - poly[i].y + 1e-12) + poly[i].x);
+        if (intersect) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    };
+
+  auto distanceToSegment = [](const Point2D & a, const Point2D & b, const Point2D & p) {
+      const double vx = b.x - a.x;
+      const double vy = b.y - a.y;
+      const double wx = p.x - a.x;
+      const double wy = p.y - a.y;
+      const double c1 = vx * wx + vy * wy;
+      if (c1 <= 0.0) {
+        return std::hypot(wx, wy);
+      }
+      const double c2 = vx * vx + vy * vy;
+      if (c2 <= c1) {
+        return std::hypot(p.x - b.x, p.y - b.y);
+      }
+      const double t = c1 / c2;
+      const double proj_x = a.x + t * vx;
+      const double proj_y = a.y + t * vy;
+      return std::hypot(p.x - proj_x, p.y - proj_y);
+    };
+
+  auto distanceToPolygon = [&](const std::vector<Point2D> & poly, const Point2D & p) {
+      double best = std::numeric_limits<double>::infinity();
+      if (pointInside(poly, p)) {
+        return 0.0;
+      }
+      for (size_t i = 0; i < poly.size(); ++i) {
+        const auto & a = poly[i];
+        const auto & b = poly[(i + 1) % poly.size()];
+        best = std::min(best, distanceToSegment(a, b, p));
+      }
+      return best;
+    };
+
+  for (const auto & c : clusters) {
+    if (c.points.empty()) {
+      continue;
+    }
+    const auto hull = computeHull(c.points);
+    if (hull.empty()) {
+      continue;
+    }
+    std::vector<Point2D> poly;
+    if (hull.size() >= 3) {
+      poly = hull;  // 凸包でより点群に沿う形に塗る
+    } else {
+      const auto obb = computeObb(hull);
+      poly.assign(obb.begin(), obb.end());
+    }
+
+    double min_x = poly.front().x;
+    double max_x = poly.front().x;
+    double min_y = poly.front().y;
+    double max_y = poly.front().y;
+    for (const auto & pt : poly) {
+      min_x = std::min(min_x, pt.x);
+      max_x = std::max(max_x, pt.x);
+      min_y = std::min(min_y, pt.y);
+      max_y = std::max(max_y, pt.y);
+    }
+    const double margin = inflation;
+    const int min_col = std::max(
+      0, static_cast<int>(std::floor((min_x - margin - origin_x) / resolution)));
+    const int max_col = std::min(
+      static_cast<int>(grid.info.width) - 1,
+      static_cast<int>(std::floor((max_x + margin - origin_x) / resolution)));
+    const int min_row = std::max(
+      0, static_cast<int>(std::floor((min_y - margin - origin_y) / resolution)));
+    const int max_row = std::min(
+      static_cast<int>(grid.info.height) - 1,
+      static_cast<int>(std::floor((max_y + margin - origin_y) / resolution)));
+
+    if (min_col > max_col || min_row > max_row) {
+      continue;
+    }
+
+    for (int row = min_row; row <= max_row; ++row) {
+      for (int col = min_col; col <= max_col; ++col) {
+        const double cx = origin_x + (static_cast<double>(col) + 0.5) * resolution;
+        const double cy = origin_y + (static_cast<double>(row) + 0.5) * resolution;
+        Point2D cell_pt{cx, cy};
+        const bool inside = pointInside(poly, cell_pt);
+        const double dist = distanceToPolygon(poly, cell_pt);
+        if (inside || dist <= inflation) {
+          const size_t idx = static_cast<size_t>(row) * grid.info.width + static_cast<size_t>(col);
+          grid.data[idx] = 100;
+        }
+      }
+    }
+
+    for (const auto & pt : c.points) {
+      auto idx = toIndex(pt.x, pt.y);
+      if (idx.has_value()) {
+        grid.data[*idx] = 100;
+      }
+    }
+  }
+
+  return grid;
 }
 
 std::vector<Point2D> ObstacleTrackerNode::computeHull(const std::vector<Point2D> & pts) const

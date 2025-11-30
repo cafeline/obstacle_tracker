@@ -56,6 +56,10 @@ public:
     const std::optional<Point2D> & sensor_origin) const;
   std::vector<Point2D> computeHull(const std::vector<Point2D> & pts) const;
   std::array<Point2D, 4> computeObb(const std::vector<Point2D> & hull) const;
+  void setTestTransform(const geometry_msgs::msg::TransformStamped & tf);
+  std::vector<Cluster> transformClusters(
+    const std::vector<Cluster> & clusters,
+    const geometry_msgs::msg::TransformStamped * tf) const;
 
 private:
   void laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg);

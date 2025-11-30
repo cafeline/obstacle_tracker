@@ -2,6 +2,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <chrono>
+#include <thread>
 #include "obstacle_tracker/obstacle_tracker_node.hpp"
 
 using obstacle_tracker::ObstacleTrackerNode;
@@ -158,6 +162,61 @@ TEST(ObstacleTrackerNodeTest, MaskFollowsHullNotBoundingBox)
 
   // 三角形辺近傍は占有
   EXPECT_EQ(grid.data[idx(4, 4)], 100);
+}
+
+TEST(ObstacleTrackerNodeTest, ClustersAreSplitInSensorFrameBeforeTransform)
+{
+  auto node = std::make_shared<ObstacleTrackerNode>();
+
+  geometry_msgs::msg::TransformStamped tf;
+  tf.header.stamp = node->now();
+  tf.header.frame_id = "map";
+  tf.child_frame_id = "lidar";
+  tf.transform.translation.x = 50.0;
+  tf.transform.translation.y = 0.0;
+  tf.transform.rotation.w = 1.0;
+  node->setTestTransform(tf);
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node);
+
+  auto receiver = std::make_shared<rclcpp::Node>("obstacles_receiver");
+  visualization_msgs::msg::MarkerArray::SharedPtr latest;
+  bool got = false;
+  auto sub = receiver->create_subscription<visualization_msgs::msg::MarkerArray>(
+    "/obstacles", 10,
+    [&](const visualization_msgs::msg::MarkerArray & msg) {
+      latest = std::make_shared<visualization_msgs::msg::MarkerArray>(msg);
+      got = true;
+    });
+  (void)sub;
+  exec.add_node(receiver);
+
+  auto pub_node = std::make_shared<rclcpp::Node>("scan_publisher");
+  auto scan_pub = pub_node->create_publisher<sensor_msgs::msg::LaserScan>(
+    "/scan", rclcpp::SensorDataQoS());
+  exec.add_node(pub_node);
+
+  sensor_msgs::msg::LaserScan scan;
+  scan.header.frame_id = "lidar";
+  scan.header.stamp = node->now();
+  scan.angle_min = 1.5708;
+  scan.angle_max = 1.8208;
+  scan.angle_increment = 0.05;
+  scan.range_min = 0.1;
+  scan.range_max = 100.0;
+  scan.ranges = {1.0, 1.0, 1.0, 2.0, 2.0, 2.0};
+  scan_pub->publish(scan);
+
+  const auto start = std::chrono::steady_clock::now();
+  while (!got && (std::chrono::steady_clock::now() - start) < std::chrono::seconds(1)) {
+    exec.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  ASSERT_TRUE(got);
+  ASSERT_TRUE(latest);
+  EXPECT_EQ(latest->markers.size(), 4u);
 }
 
 int main(int argc, char ** argv)

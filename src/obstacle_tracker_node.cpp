@@ -46,27 +46,34 @@ ObstacleTrackerNode::ObstacleTrackerNode()
 void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
 {
   auto points_lidar = scanToPoints(*msg);
+  if (points_lidar.empty()) {
+    return;
+  }
+  auto clusters_lidar = segmentByRangeJump(points_lidar);
+
   bool transformed = false;
   auto points_map = transformToMap(
     points_lidar, msg->header.frame_id, msg->header.stamp, transformed);
   if (points_map.empty()) {
     return;
   }
+  const geometry_msgs::msg::TransformStamped * tf_used =
+    (transformed && last_tf_) ? &(*last_tf_) : nullptr;
+  auto clusters_map = transformClusters(clusters_lidar, tf_used);
   const std::string marker_frame = transformed ? target_frame_ : msg->header.frame_id;
-  auto clusters = segmentByRangeJump(points_map);
 
   rclcpp::Time stamp(msg->header.stamp);
   std::optional<Point2D> sensor_origin;
-  if (last_tf_) {
+  if (tf_used) {
     sensor_origin = Point2D{
-      last_tf_->transform.translation.x,
-      last_tf_->transform.translation.y};
+      tf_used->transform.translation.x,
+      tf_used->transform.translation.y};
   }
-  auto mask = buildOccupancyMask(points_map, clusters, stamp, marker_frame, sensor_origin);
+  auto mask = buildOccupancyMask(points_map, clusters_map, stamp, marker_frame, sensor_origin);
   mask_pub_->publish(mask);
 
-  auto cubes = buildCubes(clusters, true, stamp, marker_frame);
-  auto outlines = buildOutlines(clusters, true, stamp, marker_frame);
+  auto cubes = buildCubes(clusters_map, true, stamp, marker_frame);
+  auto outlines = buildOutlines(clusters_map, true, stamp, marker_frame);
 
   visualization_msgs::msg::MarkerArray merged;
   merged.markers.reserve(cubes.markers.size() + outlines.markers.size());
@@ -170,6 +177,64 @@ std::vector<Point2D> ObstacleTrackerNode::transformToMap(
     out.push_back({out_pt.point.x, out_pt.point.y});
   }
   success = true;
+  return out;
+}
+
+void ObstacleTrackerNode::setTestTransform(const geometry_msgs::msg::TransformStamped & tf)
+{
+  if (tf_buffer_) {
+    tf_buffer_->setTransform(tf, "test_authority", true);
+    last_tf_ = tf;
+  }
+}
+
+std::vector<Cluster> ObstacleTrackerNode::transformClusters(
+  const std::vector<Cluster> & clusters,
+  const geometry_msgs::msg::TransformStamped * tf) const
+{
+  if (tf == nullptr) {
+    return clusters;
+  }
+
+  std::vector<Cluster> out;
+  out.reserve(clusters.size());
+  for (const auto & c : clusters) {
+    if (c.points.empty()) {
+      out.push_back(c);
+      continue;
+    }
+    Cluster transformed;
+    double min_x = std::numeric_limits<double>::max();
+    double max_x = -std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_y = -std::numeric_limits<double>::max();
+    double sum_x = 0.0, sum_y = 0.0;
+    transformed.points.reserve(c.points.size());
+    for (const auto & pt : c.points) {
+      geometry_msgs::msg::PointStamped in, out_pt;
+      in.header.frame_id = tf->child_frame_id;
+      in.header.stamp = tf->header.stamp;
+      in.point.x = pt.x;
+      in.point.y = pt.y;
+      in.point.z = 0.0;
+      tf2::doTransform(in, out_pt, *tf);
+      Point2D mapped{out_pt.point.x, out_pt.point.y};
+      transformed.points.push_back(mapped);
+      sum_x += mapped.x;
+      sum_y += mapped.y;
+      min_x = std::min(min_x, mapped.x);
+      max_x = std::max(max_x, mapped.x);
+      min_y = std::min(min_y, mapped.y);
+      max_y = std::max(max_y, mapped.y);
+    }
+    const double count = static_cast<double>(transformed.points.size());
+    transformed.centroid.x = sum_x / count;
+    transformed.centroid.y = sum_y / count;
+    transformed.length = std::max(0.1, max_x - min_x);
+    transformed.width = std::max(0.1, max_y - min_y);
+    out.push_back(transformed);
+  }
+
   return out;
 }
 

@@ -35,7 +35,7 @@ struct Cluster
 class ObstacleTrackerNode : public rclcpp::Node
 {
 public:
-  ObstacleTrackerNode();
+  explicit ObstacleTrackerNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
   // exposed for tests
   std::vector<Point2D> scanToPoints(const sensor_msgs::msg::LaserScan & scan) const;

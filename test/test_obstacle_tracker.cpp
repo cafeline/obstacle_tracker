@@ -79,6 +79,24 @@ TEST(ObstacleTrackerNodeTest, TransformFailureSkipsPublish)
   EXPECT_EQ(out.size(), pts.size());
 }
 
+TEST(ObstacleTrackerNodeTest, TransformLookupDoesNotBlockWhenTfUnavailable)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("tf_timeout_sec", 1.0)});
+  auto node = std::make_shared<ObstacleTrackerNode>(options);
+
+  std::vector<Point2D> pts{{1.0, 0.0}};
+  bool ok = true;
+  const auto start = std::chrono::steady_clock::now();
+  auto out = node->transformToMap(pts, "lidar_link", rclcpp::Time(0), ok);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - start).count();
+
+  EXPECT_FALSE(ok);
+  EXPECT_EQ(out.size(), pts.size());
+  EXPECT_LT(elapsed_ms, 100);
+}
+
 TEST(ObstacleTrackerNodeTest, TransformToMapAppliesFullQuaternion)
 {
   auto node = std::make_shared<ObstacleTrackerNode>();

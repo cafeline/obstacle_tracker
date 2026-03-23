@@ -8,8 +8,8 @@
 namespace obstacle_tracker
 {
 
-ObstacleTrackerNode::ObstacleTrackerNode()
-: Node("obstacle_tracker_node")
+ObstacleTrackerNode::ObstacleTrackerNode(const rclcpp::NodeOptions & options)
+: Node("obstacle_tracker_node", options)
 {
   // Parameters (mimic pointcloud2_cutter style: declare and log)
   scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
@@ -154,9 +154,10 @@ std::vector<Point2D> ObstacleTrackerNode::transformToMap(
   }
 
   geometry_msgs::msg::TransformStamped tf;
+  const auto no_wait = rclcpp::Duration::from_seconds(0.0);
   try {
     tf = tf_buffer_->lookupTransform(
-      target_frame_, frame, stamp, rclcpp::Duration::from_seconds(tf_timeout_sec_));
+      target_frame_, frame, stamp, no_wait);
     last_tf_ = tf;
   } catch (const tf2::TransformException & ex) {
     bool recovered = false;
@@ -164,7 +165,7 @@ std::vector<Point2D> ObstacleTrackerNode::transformToMap(
     try {
       tf = tf_buffer_->lookupTransform(
         target_frame_, frame, rclcpp::Time(0),
-        rclcpp::Duration::from_seconds(tf_timeout_sec_));
+        no_wait);
       last_tf_ = tf;
       recovered = true;
       RCLCPP_WARN(

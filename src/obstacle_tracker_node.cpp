@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <functional>
 
 namespace obstacle_tracker
 {
@@ -21,8 +22,8 @@ ObstacleTrackerNode::ObstacleTrackerNode()
   range_jump_min_ = declare_parameter<double>("range_jump_min", 0.05);
   min_cluster_points_ = declare_parameter<int>("min_cluster_points", 3);
   range_gap_abs_ = declare_parameter<double>("range_gap_abs", 0.5);
-  declare_parameter<double>("mask_resolution", 0.05);
-  declare_parameter<double>("mask_inflation_radius", 0.1);
+  mask_resolution_ = declare_parameter<double>("mask_resolution", 0.05);
+  mask_inflation_radius_ = declare_parameter<double>("mask_inflation_radius", 0.1);
 
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -37,10 +38,36 @@ ObstacleTrackerNode::ObstacleTrackerNode()
   auto mask_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
   mask_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(mask_topic_, mask_qos);
 
+  parameter_callback_handle_ = this->add_on_set_parameters_callback(
+    std::bind(&ObstacleTrackerNode::onParameterChange, this, std::placeholders::_1));
+
   RCLCPP_INFO(
     this->get_logger(),
     "obstacle_tracker 起動: scan=%s, obstacles=%s, mask=%s, target_frame=%s",
     scan_topic_.c_str(), obstacles_topic_.c_str(), mask_topic_.c_str(), target_frame_.c_str());
+}
+
+rcl_interfaces::msg::SetParametersResult ObstacleTrackerNode::onParameterChange(
+  const std::vector<rclcpp::Parameter> & params)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+  for (const auto & param : params) {
+    if (param.get_name() == "processing_range" &&
+      param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+    {
+      processing_range_ = param.as_double();
+    } else if (param.get_name() == "mask_resolution" &&
+      param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+    {
+      mask_resolution_ = param.as_double();
+    } else if (param.get_name() == "mask_inflation_radius" &&
+      param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+    {
+      mask_inflation_radius_ = param.as_double();
+    }
+  }
+  return result;
 }
 
 void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -57,9 +84,13 @@ void ObstacleTrackerNode::laserScanCallback(const sensor_msgs::msg::LaserScan::S
   if (points_map.empty()) {
     return;
   }
+  const bool transformed_by_tf = transformed && (msg->header.frame_id != target_frame_);
   const geometry_msgs::msg::TransformStamped * tf_used =
-    (transformed && last_tf_) ? &(*last_tf_) : nullptr;
-  auto clusters_map = transformClusters(clusters_lidar, tf_used);
+    (transformed_by_tf && last_tf_) ? &(*last_tf_) : nullptr;
+  const auto clusters_map =
+    (transformed && tf_used != nullptr) ? transformClusters(
+    clusters_lidar,
+    tf_used) : clusters_lidar;
   const std::string marker_frame = transformed ? target_frame_ : msg->header.frame_id;
 
   rclcpp::Time stamp(msg->header.stamp);
@@ -166,15 +197,12 @@ std::vector<Point2D> ObstacleTrackerNode::transformToMap(
     }
   }
 
+  tf2::Transform tf2_transform;
+  tf2::fromMsg(tf.transform, tf2_transform);
+
   for (const auto & p : points) {
-    geometry_msgs::msg::PointStamped in, out_pt;
-    in.header.frame_id = frame;
-    in.header.stamp = stamp;
-    in.point.x = p.x;
-    in.point.y = p.y;
-    in.point.z = 0.0;
-    tf2::doTransform(in, out_pt, tf);
-    out.push_back({out_pt.point.x, out_pt.point.y});
+    const tf2::Vector3 mapped = tf2_transform * tf2::Vector3(p.x, p.y, 0.0);
+    out.push_back({mapped.x(), mapped.y()});
   }
   success = true;
   return out;
@@ -376,12 +404,9 @@ nav_msgs::msg::OccupancyGrid ObstacleTrackerNode::buildOccupancyMask(
   grid.header.frame_id = frame_id;
   grid.header.stamp = stamp;
 
-  const double resolution_param = this->get_parameter("mask_resolution").as_double();
-  const double range_param = this->get_parameter("processing_range").as_double();
-  const double inflation_param = this->get_parameter("mask_inflation_radius").as_double();
-  const double resolution = std::max(0.01, resolution_param);
-  const double range = std::max(resolution, range_param);
-  const double inflation = std::max(0.0, inflation_param);
+  const double resolution = std::max(0.01, mask_resolution_);
+  const double range = std::max(resolution, processing_range_);
+  const double inflation = std::max(0.0, mask_inflation_radius_);
   const uint32_t width = static_cast<uint32_t>(std::ceil((range * 2.0) / resolution)) + 1;
   grid.info.resolution = resolution;
   grid.info.width = width;
@@ -444,9 +469,6 @@ nav_msgs::msg::OccupancyGrid ObstacleTrackerNode::buildOccupancyMask(
 
   auto distanceToPolygon = [&](const std::vector<Point2D> & poly, const Point2D & p) {
       double best = std::numeric_limits<double>::infinity();
-      if (pointInside(poly, p)) {
-        return 0.0;
-      }
       for (size_t i = 0; i < poly.size(); ++i) {
         const auto & a = poly[i];
         const auto & b = poly[(i + 1) % poly.size()];
@@ -503,8 +525,12 @@ nav_msgs::msg::OccupancyGrid ObstacleTrackerNode::buildOccupancyMask(
         const double cy = origin_y + (static_cast<double>(row) + 0.5) * resolution;
         Point2D cell_pt{cx, cy};
         const bool inside = pointInside(poly, cell_pt);
-        const double dist = distanceToPolygon(poly, cell_pt);
-        if (inside || dist <= inflation) {
+        if (inside) {
+          const size_t idx = static_cast<size_t>(row) * grid.info.width + static_cast<size_t>(col);
+          grid.data[idx] = 100;
+          continue;
+        }
+        if (inflation > 0.0 && distanceToPolygon(poly, cell_pt) <= inflation) {
           const size_t idx = static_cast<size_t>(row) * grid.info.width + static_cast<size_t>(col);
           grid.data[idx] = 100;
         }

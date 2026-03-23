@@ -6,6 +6,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -63,11 +64,14 @@ public:
 
 private:
   void laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
+  rcl_interfaces::msg::SetParametersResult onParameterChange(
+    const std::vector<rclcpp::Parameter> & params);
 
   // ROS
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr obstacles_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr mask_pub_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   mutable std::optional<geometry_msgs::msg::TransformStamped> last_tf_;
@@ -83,6 +87,8 @@ private:
   double range_jump_min_{};
   int min_cluster_points_{};
   double range_gap_abs_{};
+  double mask_resolution_{};
+  double mask_inflation_radius_{};
 };
 
 }  // namespace obstacle_tracker

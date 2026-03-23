@@ -79,6 +79,33 @@ TEST(ObstacleTrackerNodeTest, TransformFailureSkipsPublish)
   EXPECT_EQ(out.size(), pts.size());
 }
 
+TEST(ObstacleTrackerNodeTest, TransformToMapAppliesFullQuaternion)
+{
+  auto node = std::make_shared<ObstacleTrackerNode>();
+
+  geometry_msgs::msg::TransformStamped tf;
+  tf.header.stamp = node->now();
+  tf.header.frame_id = "map";
+  tf.child_frame_id = "lidar";
+  tf.transform.translation.x = 10.0;
+  tf.transform.translation.y = 20.0;
+  tf.transform.translation.z = 30.0;
+  const double half_sqrt2 = std::sqrt(0.5);
+  tf.transform.rotation.x = half_sqrt2;  // roll = +90deg
+  tf.transform.rotation.y = 0.0;
+  tf.transform.rotation.z = 0.0;
+  tf.transform.rotation.w = half_sqrt2;
+  node->setTestTransform(tf);
+
+  bool ok = false;
+  auto out = node->transformToMap(std::vector<Point2D>{{0.0, 1.0}}, "lidar", rclcpp::Time(0), ok);
+
+  ASSERT_TRUE(ok);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_NEAR(out[0].x, 10.0, 1e-6);
+  EXPECT_NEAR(out[0].y, 20.0, 1e-6);
+}
+
 TEST(ObstacleTrackerNodeTest, ConvexHullReturnsOrdered)
 {
   auto node = std::make_shared<ObstacleTrackerNode>();
@@ -217,6 +244,83 @@ TEST(ObstacleTrackerNodeTest, ClustersAreSplitInSensorFrameBeforeTransform)
   ASSERT_TRUE(got);
   ASSERT_TRUE(latest);
   EXPECT_EQ(latest->markers.size(), 4u);
+
+  std::vector<double> cube_xs;
+  for (const auto & marker : latest->markers) {
+    if (marker.type == visualization_msgs::msg::Marker::CUBE) {
+      cube_xs.push_back(marker.pose.position.x);
+    }
+  }
+  ASSERT_EQ(cube_xs.size(), 2u);
+  for (double x : cube_xs) {
+    // 変換が1回なら x はおおむね 50 付近、二重変換だと 100 付近になる
+    EXPECT_GT(x, 45.0);
+    EXPECT_LT(x, 60.0);
+  }
+}
+
+TEST(ObstacleTrackerNodeTest, MapFrameScanIsNotReTransformedByStaleTf)
+{
+  auto node = std::make_shared<ObstacleTrackerNode>();
+
+  geometry_msgs::msg::TransformStamped tf;
+  tf.header.stamp = node->now();
+  tf.header.frame_id = "map";
+  tf.child_frame_id = "lidar";
+  tf.transform.translation.x = 50.0;
+  tf.transform.translation.y = 0.0;
+  tf.transform.rotation.w = 1.0;
+  node->setTestTransform(tf);  // last_tf_ を意図的に埋める
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node);
+
+  auto receiver = std::make_shared<rclcpp::Node>("obstacles_receiver_map_frame");
+  visualization_msgs::msg::MarkerArray::SharedPtr latest;
+  bool got = false;
+  auto sub = receiver->create_subscription<visualization_msgs::msg::MarkerArray>(
+    "/obstacles", 10,
+    [&](const visualization_msgs::msg::MarkerArray & msg) {
+      latest = std::make_shared<visualization_msgs::msg::MarkerArray>(msg);
+      got = true;
+    });
+  (void)sub;
+  exec.add_node(receiver);
+
+  auto pub_node = std::make_shared<rclcpp::Node>("scan_publisher_map_frame");
+  auto scan_pub = pub_node->create_publisher<sensor_msgs::msg::LaserScan>(
+    "/scan", rclcpp::SensorDataQoS());
+  exec.add_node(pub_node);
+
+  sensor_msgs::msg::LaserScan scan;
+  scan.header.frame_id = "map";  // target_frame と同じ
+  scan.header.stamp = node->now();
+  scan.angle_min = -0.05;
+  scan.angle_max = 0.05;
+  scan.angle_increment = 0.05;
+  scan.range_min = 0.1;
+  scan.range_max = 100.0;
+  scan.ranges = {1.0, 1.0, 1.0};
+  scan_pub->publish(scan);
+
+  const auto start = std::chrono::steady_clock::now();
+  while (!got && (std::chrono::steady_clock::now() - start) < std::chrono::seconds(1)) {
+    exec.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  ASSERT_TRUE(got);
+  ASSERT_TRUE(latest);
+
+  std::vector<double> cube_xs;
+  for (const auto & marker : latest->markers) {
+    if (marker.type == visualization_msgs::msg::Marker::CUBE) {
+      cube_xs.push_back(marker.pose.position.x);
+    }
+  }
+  ASSERT_EQ(cube_xs.size(), 1u);
+  EXPECT_GT(cube_xs[0], 0.5);
+  EXPECT_LT(cube_xs[0], 2.0);
 }
 
 int main(int argc, char ** argv)
